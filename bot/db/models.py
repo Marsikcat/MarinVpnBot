@@ -15,7 +15,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -49,9 +48,6 @@ class User(Base):
     username: Mapped[Optional[str]] = mapped_column(String(64))
     first_name: Mapped[Optional[str]] = mapped_column(String(128))
     language: Mapped[str] = mapped_column(String(8), default="ru")
-    balance: Mapped[float] = mapped_column(Float, default=0.0)  # рублей на внутреннем счёте
-    referrer_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("users.id"))
-    referral_earned: Mapped[float] = mapped_column(Float, default=0.0)
     trial_used: Mapped[bool] = mapped_column(Boolean, default=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -140,7 +136,7 @@ class Payment(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
     plan_id: Mapped[Optional[int]] = mapped_column(ForeignKey("plans.id"))
-    provider: Mapped[str] = mapped_column(String(32))  # stars | yookassa | cryptobot | balance | admin
+    provider: Mapped[str] = mapped_column(String(32))  # stars | yookassa | cryptobot | sbp
     external_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
     amount: Mapped[float] = mapped_column(Float)
     currency: Mapped[str] = mapped_column(String(8), default="RUB")
@@ -149,45 +145,11 @@ class Payment(Base):
     )
     days: Mapped[int] = mapped_column(Integer, default=0)
     pay_url: Mapped[Optional[str]] = mapped_column(Text)
-    promo_code: Mapped[Optional[str]] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     user: Mapped["User"] = relationship(lazy="selectin")
     plan: Mapped[Optional["Plan"]] = relationship(lazy="selectin")
-
-
-class PromoCode(Base):
-    __tablename__ = "promo_codes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
-    discount_percent: Mapped[int] = mapped_column(Integer, default=0)
-    bonus_days: Mapped[int] = mapped_column(Integer, default=0)
-    max_uses: Mapped[int] = mapped_column(Integer, default=0)  # 0 = без ограничений
-    used_count: Mapped[int] = mapped_column(Integer, default=0)
-    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-    def is_usable(self) -> bool:
-        if not self.is_active:
-            return False
-        if self.max_uses and self.used_count >= self.max_uses:
-            return False
-        if self.expires_at and self.expires_at < utcnow():
-            return False
-        return True
-
-
-class PromoUse(Base):
-    __tablename__ = "promo_uses"
-    __table_args__ = (UniqueConstraint("promo_id", "user_id", name="uq_promo_user"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    promo_id: Mapped[int] = mapped_column(ForeignKey("promo_codes.id"))
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
-    used_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Setting(Base):

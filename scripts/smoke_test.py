@@ -1,4 +1,4 @@
-"""Сквозная проверка логики без Telegram: БД, тарифы, оплата, продление, рефералы, истечение.
+"""Сквозная проверка логики без Telegram: БД, тарифы, оплата, продление, истечение.
 
 Запуск:  python scripts/smoke_test.py
 Использует отдельную БД data/smoke.db и mock-панель — реальные сервисы не трогает.
@@ -19,9 +19,6 @@ os.environ["VPN_PROVIDER"] = "mock"
 os.environ["TRIAL_ENABLED"] = "true"
 os.environ["TRIAL_DAYS"] = "3"
 os.environ["TRIAL_TRAFFIC_GB"] = "10"
-os.environ["REFERRAL_ENABLED"] = "true"
-os.environ["REFERRAL_PERCENT"] = "20"
-os.environ["REFERRAL_BONUS_DAYS"] = "0"
 os.environ["STARS_RUB_RATE"] = "1.6"
 os.environ["PAY_STARS_ENABLED"] = "true"
 os.environ["PAY_SBP_ENABLED"] = "false"
@@ -72,9 +69,8 @@ async def main() -> None:
         check(len(plans) == 4, f"тарифы засеяны ({len(plans)} шт.)")
         plan = plans[0]
 
-        referrer, _ = await repo.get_or_create_user(session, 1001, "inviter", "Инвайтер")
-        buyer, created = await repo.get_or_create_user(session, 1002, "buyer", "Покупатель", referrer_id=1001)
-        check(created and buyer.referrer_id == 1001, "реферальная связь сохранена")
+        buyer, created = await repo.get_or_create_user(session, 1002, "buyer", "Покупатель")
+        check(created, "пользователь создан")
 
         # --- пробный период
         trial = await subscriptions.grant_trial(session, buyer)
@@ -97,20 +93,8 @@ async def main() -> None:
         again = await subscriptions.complete_payment(session, bot, payment)
         check(again.expires_at == subscription.expires_at, "повторное подтверждение идемпотентно")
 
-        # --- реферальное вознаграждение
-        await session.refresh(referrer)
-        expected = round(plan.price_rub * 20 / 100, 2)
-        check(referrer.balance == expected, f"рефереру начислено {expected} ₽")
-
-        # --- оплата с баланса
-        balance_before = referrer.balance
-        ref_payment = await repo.create_payment(
-            session, referrer.id, plan, provider="balance", amount=balance_before
-        )
-        ref_sub = await subscriptions.complete_payment(session, bot, ref_payment)
-        check(ref_sub is not None and ref_sub.is_active, "подписка за баланс выдана")
         revenue = await repo.total_revenue(session)
-        check(revenue == plan.price_rub, "оплата с баланса не попадает в выручку")
+        check(revenue == plan.price_rub, "выручка учтена один раз")
 
         # --- истечение подписки
         subscription.expires_at = utcnow() - timedelta(hours=1)
@@ -123,8 +107,9 @@ async def main() -> None:
         # --- пересчёт в звёзды
         check(rub_to_stars(149) == 94, f"149 ₽ -> {rub_to_stars(149)} звёзд при курсе 1.6")
 
+        # единственная подписка только что отключена
         active = await repo.count_active_subscriptions(session)
-        check(active == 1, f"активных подписок: {active}")
+        check(active == 0, f"активных подписок после отключения: {active}")
 
     print("\nВсе проверки пройдены.")
 

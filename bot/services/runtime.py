@@ -36,8 +36,6 @@ FIELDS: List[Field] = [
     Field("trial_traffic_gb", "Трафик триала, ГБ", "int", "0 — безлимит", maximum=10000),
     Field("default_traffic_gb", "Лимит трафика по умолчанию, ГБ", "int",
           "0 — безлимит; применяется к новым тарифам и ручной выдаче дней", maximum=100000),
-    Field("referral_enabled", "Реферальная программа", "bool"),
-    Field("referral_percent", "Реферальный процент", "int", "% с каждой оплаты", maximum=100),
     Field("stars_rub_rate", "Рублей в одной звезде", "float", "курс пересчёта Stars", minimum=0.1, maximum=100),
     Field("support_url", "Ссылка на поддержку", "str", "например https://t.me/ваш_ник"),
     Field("channel_url", "Ссылка на канал", "str", "можно оставить пустой: минус — чтобы убрать"),

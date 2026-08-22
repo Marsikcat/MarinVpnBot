@@ -22,9 +22,6 @@ os.environ["VPN_PROVIDER"] = "mock"
 os.environ["TRIAL_ENABLED"] = "true"
 os.environ["TRIAL_DAYS"] = "3"
 os.environ["TRIAL_TRAFFIC_GB"] = "10"
-os.environ["REFERRAL_ENABLED"] = "true"
-os.environ["REFERRAL_PERCENT"] = "20"
-os.environ["REFERRAL_BONUS_DAYS"] = "0"
 os.environ["STARS_RUB_RATE"] = "1.6"
 os.environ["PAY_STARS_ENABLED"] = "true"
 os.environ["PAY_SBP_ENABLED"] = "false"
@@ -116,14 +113,12 @@ async def main() -> None:
     dp = create_dispatcher()
     pause = 0.45  # антифлуд-мидлварь: 0.4 c между событиями
 
-    # --- /start с реферальной ссылкой
-    async with session_factory() as session:
-        await repo.get_or_create_user(session, 999000, "inviter", "Пригласивший")
-    await dp.feed_update(bot, make_message("/start ref999000"))
+    # --- /start
+    await dp.feed_update(bot, make_message("/start"))
     check("SendMessage" in [c[0] for c in CALLS], "/start ответил приветствием")
     async with session_factory() as session:
         user = await repo.get_user(session, USER.id)
-        check(user is not None and user.referrer_id == 999000, "реферер записан из deep-link")
+        check(user is not None, "пользователь зарегистрирован")
 
     # --- пробный период
     await asyncio.sleep(pause)
@@ -198,9 +193,6 @@ async def main() -> None:
         check(payment.external_id == "charge_test_1", "сохранён charge_id для возврата звёзд")
         check(subscription.expires_at > before, "срок подписки продлён")
         check(not subscription.is_trial, "подписка перестала быть пробной")
-
-        referrer = await repo.get_user(session, 999000)
-        check(referrer.balance > 0, f"рефереру начислено {referrer.balance} ₽")
 
     # --- профиль
     await asyncio.sleep(pause)

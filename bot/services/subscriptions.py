@@ -20,7 +20,6 @@ from bot.db.models import (
     User,
     utcnow,
 )
-from bot.services.referrals import reward_referrer
 from bot.services.runtime import runtime
 from bot.texts import ru
 from bot.services.vpn.base import VpnPanelError
@@ -193,13 +192,6 @@ async def complete_payment(session: AsyncSession, bot: Bot, payment: Payment) ->
     payment.status = PaymentStatus.paid
     payment.paid_at = utcnow()
     await session.commit()
-
-    if payment.promo_code:
-        promo = await repo.get_promo(session, payment.promo_code)
-        if promo and not await repo.promo_used_by(session, promo.id, user.id):
-            await repo.register_promo_use(session, promo, user.id)
-
-    await reward_referrer(session, bot, user, payment)
 
     plan_title = plan.title if plan else f"{days} дн."
     if was_active and previous_until:

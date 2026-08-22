@@ -30,9 +30,7 @@ COMMANDS = [
     BotCommand(command="buy", description="Купить подписку"),
     BotCommand(command="renew", description="Продлить подписку"),
     BotCommand(command="trial", description="Пробный период"),
-    BotCommand(command="profile", description="Профиль и баланс"),
-    BotCommand(command="ref", description="Пригласить друга"),
-    BotCommand(command="promo", description="Ввести промокод"),
+    BotCommand(command="profile", description="Профиль"),
     BotCommand(command="help", description="Как подключиться"),
 ]
 

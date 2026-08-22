@@ -57,11 +57,6 @@ class Settings(BaseSettings):
     # 0 = безлимит; применяется к новым тарифам и выдаче дней вручную
     default_traffic_gb: int = Field(0, alias="DEFAULT_TRAFFIC_GB")
 
-    # --- Referrals ---
-    referral_enabled: bool = Field(True, alias="REFERRAL_ENABLED")
-    referral_percent: int = Field(20, alias="REFERRAL_PERCENT")
-    referral_bonus_days: int = Field(0, alias="REFERRAL_BONUS_DAYS")
-
     # --- Payments ---
     pay_stars_enabled: bool = Field(True, alias="PAY_STARS_ENABLED")
     stars_rub_rate: float = Field(1.6, alias="STARS_RUB_RATE")

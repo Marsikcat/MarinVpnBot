@@ -52,6 +52,6 @@ async def cb_plan(
     await edit_view(
         callback,
         render_plan(plan, subscription),
-        ikb.pay_methods_kb(plan, balance=user.balance or 0),
+        ikb.pay_methods_kb(plan),
     )
     await callback.answer()

@@ -11,8 +11,6 @@ from bot.db.models import (
     Payment,
     PaymentStatus,
     Plan,
-    PromoCode,
-    PromoUse,
     Setting,
     Subscription,
     SubscriptionStatus,
@@ -31,7 +29,6 @@ async def get_or_create_user(
     user_id: int,
     username: Optional[str] = None,
     first_name: Optional[str] = None,
-    referrer_id: Optional[int] = None,
 ) -> tuple[User, bool]:
     user = await session.get(User, user_id)
     if user:
@@ -45,12 +42,7 @@ async def get_or_create_user(
             await session.commit()
         return user, False
 
-    if referrer_id == user_id:
-        referrer_id = None
-    if referrer_id is not None and not await session.get(User, referrer_id):
-        referrer_id = None
-
-    user = User(id=user_id, username=username, first_name=first_name, referrer_id=referrer_id)
+    user = User(id=user_id, username=username, first_name=first_name)
     session.add(user)
     await session.commit()
     return user, True
@@ -62,10 +54,6 @@ async def count_users(session: AsyncSession) -> int:
 
 async def count_new_users(session: AsyncSession, since: datetime) -> int:
     return int(await session.scalar(select(func.count()).select_from(User).where(User.created_at >= since)) or 0)
-
-
-async def count_referrals(session: AsyncSession, user_id: int) -> int:
-    return int(await session.scalar(select(func.count()).select_from(User).where(User.referrer_id == user_id)) or 0)
 
 
 async def all_user_ids(session: AsyncSession) -> Sequence[int]:
@@ -232,7 +220,6 @@ async def create_payment(
     amount: float,
     currency: str = "RUB",
     days: int = 0,
-    promo_code: Optional[str] = None,
 ) -> Payment:
     payment = Payment(
         user_id=user_id,
@@ -241,7 +228,6 @@ async def create_payment(
         amount=round(amount, 2),
         currency=currency,
         days=days or (plan.days if plan else 0),
-        promo_code=promo_code,
     )
     session.add(payment)
     await session.commit()
@@ -269,14 +255,13 @@ async def revenue_since(session: AsyncSession, since: datetime) -> float:
     stmt = select(func.coalesce(func.sum(Payment.amount), 0.0)).where(
         Payment.status == PaymentStatus.paid,
         Payment.paid_at >= since,
-        Payment.provider != "balance",
     )
     return float(await session.scalar(stmt) or 0.0)
 
 
 async def total_revenue(session: AsyncSession) -> float:
     stmt = select(func.coalesce(func.sum(Payment.amount), 0.0)).where(
-        Payment.status == PaymentStatus.paid, Payment.provider != "balance"
+        Payment.status == PaymentStatus.paid
     )
     return float(await session.scalar(stmt) or 0.0)
 
@@ -295,24 +280,6 @@ async def expire_stale_payments(session: AsyncSession, hours: int = 24) -> int:
     result = await session.execute(stmt)
     await session.commit()
     return result.rowcount or 0
-
-
-# ---------------------------------------------------------------- promo
-async def get_promo(session: AsyncSession, code: str) -> Optional[PromoCode]:
-    return await session.scalar(select(PromoCode).where(PromoCode.code == code.strip().upper()))
-
-
-async def promo_used_by(session: AsyncSession, promo_id: int, user_id: int) -> bool:
-    stmt = select(func.count()).select_from(PromoUse).where(
-        PromoUse.promo_id == promo_id, PromoUse.user_id == user_id
-    )
-    return bool(await session.scalar(stmt))
-
-
-async def register_promo_use(session: AsyncSession, promo: PromoCode, user_id: int) -> None:
-    session.add(PromoUse(promo_id=promo.id, user_id=user_id))
-    promo.used_count += 1
-    await session.commit()
 
 
 # ---------------------------------------------------------------- runtime-настройки

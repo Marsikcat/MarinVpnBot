@@ -8,7 +8,6 @@ from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update, User as TgUser
 
 from bot.db import repo
-from bot.services.referrals import parse_referrer
 from bot.texts import ru
 
 log = logging.getLogger(__name__)
@@ -19,14 +18,6 @@ def _inner_event(event: TelegramObject) -> TelegramObject:
     if isinstance(event, Update):
         return event.message or event.callback_query or event.pre_checkout_query or event
     return event
-
-
-def _start_payload(event: TelegramObject) -> Optional[str]:
-    if isinstance(event, Message) and event.text and event.text.startswith("/start"):
-        parts = event.text.split(maxsplit=1)
-        if len(parts) == 2:
-            return parts[1]
-    return None
 
 
 class UserMiddleware(BaseMiddleware):
@@ -42,13 +33,11 @@ class UserMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         inner = _inner_event(event)
-        referrer_id = parse_referrer(_start_payload(inner))
         user, is_new = await repo.get_or_create_user(
             session,
             user_id=tg_user.id,
             username=tg_user.username,
             first_name=tg_user.first_name,
-            referrer_id=referrer_id,
         )
 
         if user.is_banned:

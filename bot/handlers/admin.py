@@ -1,4 +1,4 @@
-"""Админ-панель: статистика, выдача дней, промокоды, рассылка, диагностика."""
+"""Админ-панель: статистика, пользователи, выдача дней, рассылка, диагностика."""
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
 from bot.db import repo
-from bot.db.models import PromoCode, User, utcnow
+from bot.db.models import User, utcnow
 from bot.keyboards import inline as ikb
 from bot.services import subscriptions
 from bot.services.runtime import runtime
@@ -102,8 +102,6 @@ def _user_line(index: int, user: User, subscription) -> str:
         state = f"истекла {subscription.expires_at:%d.%m.%Y}"
 
     extra = ""
-    if user.balance:
-        extra += f" · {user.balance:.0f} ₽"
     if user.is_banned:
         extra += " · 🚫"
     return f"{index}. {user.title} (<code>{user.id}</code>) — {state}{extra}"
@@ -150,7 +148,7 @@ async def cb_users_export(callback: CallbackQuery, session: AsyncSession) -> Non
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=";")
     writer.writerow(
-        ["id", "username", "имя", "регистрация", "подписка до", "статус", "триал", "баланс", "рефералов", "бан"]
+        ["id", "username", "имя", "регистрация", "подписка до", "статус", "триал", "бан"]
     )
     for found in users:
         subscription = await repo.get_subscription(session, found.id)
@@ -163,8 +161,6 @@ async def cb_users_export(callback: CallbackQuery, session: AsyncSession) -> Non
                 f"{subscription.expires_at:%d.%m.%Y}" if subscription else "",
                 (subscription.status.value if subscription else "нет"),
                 "да" if found.trial_used else "нет",
-                f"{found.balance:.0f}",
-                await repo.count_referrals(session, found.id),
                 "да" if found.is_banned else "нет",
             ]
         )
@@ -249,8 +245,7 @@ async def do_find(message: Message, session: AsyncSession, state: FSMContext) ->
             f"<b>{found.title}</b>\n"
             f"ID: <code>{found.id}</code>\n"
             f"Подписка: {status}\n"
-            f"Баланс: {found.balance:.0f} ₽ · рефералов: "
-            f"{await repo.count_referrals(session, found.id)}\n"
+            f"Триал: {'использован' if found.trial_used else 'не использован'}\n"
             f"Регистрация: {found.created_at:%d.%m.%Y}"
         )
     await message.answer("\n\n".join(chunks))
@@ -308,49 +303,6 @@ async def cmd_give(message: Message, command: CommandObject, session: AsyncSessi
         await message.answer("Формат: <code>/give user_id дни</code>")
         return
     await _grant(command.args, message, session, bot)
-
-
-# ---------------------------------------------------------------- промокоды
-@router.callback_query(ikb.AdminCB.filter(F.action == "promo_new"))
-async def cb_promo_new(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdminStates.promo_new)
-    await callback.message.answer(
-        "Формат: <code>КОД скидка% бонус_дней макс_использований</code>\n"
-        "Например: <code>SUMMER 20 3 100</code>\n"
-        "Бонус и лимит можно опустить: <code>SUMMER 20</code>"
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.promo_new)
-async def do_promo_new(message: Message, session: AsyncSession, state: FSMContext) -> None:
-    await state.clear()
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.answer("Неверный формат.")
-        return
-
-    code = parts[0].upper()
-    try:
-        discount = int(parts[1])
-        bonus = int(parts[2]) if len(parts) > 2 else 0
-        max_uses = int(parts[3]) if len(parts) > 3 else 0
-    except ValueError:
-        await message.answer("Числа заданы неверно.")
-        return
-
-    if await repo.get_promo(session, code):
-        await message.answer("Такой промокод уже существует.")
-        return
-
-    session.add(
-        PromoCode(code=code, discount_percent=discount, bonus_days=bonus, max_uses=max_uses)
-    )
-    await session.commit()
-    await message.answer(
-        f"✅ Промокод <b>{code}</b>: −{discount}%, +{bonus} дн., "
-        f"лимит {max_uses or '∞'}"
-    )
 
 
 # ---------------------------------------------------------------- рассылка

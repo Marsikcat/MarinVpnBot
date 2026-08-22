@@ -70,26 +70,15 @@ def plans_kb(plans: Sequence[Plan]) -> InlineKeyboardMarkup:
     for plan in plans:
         label = f"{plan.title} — {plan.price_rub:.0f} ₽"
         builder.row(InlineKeyboardButton(text=label, callback_data=PlanCB(plan_id=plan.id).pack()))
-    if runtime.referral_enabled:
-        builder.row(
-            InlineKeyboardButton(text="🤝 Получить скидку за друзей", callback_data=MenuCB(action="referral").pack())
-        )
     return builder.as_markup()
 
 
-def pay_methods_kb(plan: Plan, balance: float = 0.0) -> InlineKeyboardMarkup:
+def pay_methods_kb(plan: Plan) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    from bot.services.payments.registry import METHOD_TITLES, available_methods
+    from bot.services.payments.registry import available_methods
 
     for code, title in available_methods():
         builder.row(InlineKeyboardButton(text=title, callback_data=PayCB(method=code, plan_id=plan.id).pack()))
-    if balance >= plan.price_rub > 0:
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{METHOD_TITLES['balance']} ({balance:.0f} ₽)",
-                callback_data=PayCB(method="balance", plan_id=plan.id).pack(),
-            )
-        )
     builder.row(InlineKeyboardButton(text="⬅️ К тарифам", callback_data=MenuCB(action="plans").pack()))
     return builder.as_markup()
 
@@ -149,8 +138,6 @@ def access_kb(subscription_url: Optional[str] = None, has_keys: bool = False) ->
 
 def profile_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🤝 Пригласить друга", callback_data=MenuCB(action="referral").pack()))
-    builder.row(InlineKeyboardButton(text="🎟 Ввести промокод", callback_data=MenuCB(action="promo").pack()))
     builder.row(InlineKeyboardButton(text="💳 Купить подписку", callback_data=MenuCB(action="plans").pack()))
     return builder.as_markup()
 
@@ -184,10 +171,7 @@ def admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💼 Тарифы", callback_data=PlanAdminCB(action="list").pack()),
         InlineKeyboardButton(text="⚙️ Настройки", callback_data=SettingCB(action="list").pack()),
     )
-    builder.row(
-        InlineKeyboardButton(text="🎁 Выдать дни", callback_data=AdminCB(action="grant").pack()),
-        InlineKeyboardButton(text="🎟 Промокод", callback_data=AdminCB(action="promo_new").pack()),
-    )
+    builder.row(InlineKeyboardButton(text="🎁 Выдать дни", callback_data=AdminCB(action="grant").pack()))
     if settings.pay_sbp_enabled:
         builder.row(
             InlineKeyboardButton(text="🏦 Заявки СБП", callback_data=AdminCB(action="claims").pack())
@@ -330,7 +314,6 @@ def app_links_kb() -> InlineKeyboardMarkup:
         ("⭐️ Happ — iPhone, iPad, Mac", "https://apps.apple.com/app/happ-proxy-utility/id6504287215"),
         ("⭐️ Happ — Android", "https://play.google.com/store/apps/details?id=com.happproxy"),
         ("⭐️ Happ — Windows, Linux, macOS", "https://github.com/Happ-proxy/happ-desktop/releases/latest"),
-        ("📺 Happ для TV — Apple TV", "https://apps.apple.com/app/happ-proxy-utility-for-tv/id6748297274"),
         ("Запасной — Streisand (iPhone)", "https://apps.apple.com/app/streisand/id6450534064"),
         ("Запасной — v2rayNG (Android)", "https://play.google.com/store/apps/details?id=com.v2ray.ang"),
     ]

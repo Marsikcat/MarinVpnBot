@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, LabeledPrice, Message, PreCheckoutQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,31 +26,12 @@ router = Router(name="payments")
 STARS_PAYLOAD = "sub"
 
 
-async def _apply_promo(
-    session: AsyncSession, state: FSMContext, user: User, plan: Plan
-) -> Tuple[float, Optional[str], int]:
-    """Возвращает (цена со скидкой, код промокода, бонусные дни)."""
-    data = await state.get_data()
-    code = data.get("promo_code")
-    if not code:
-        return plan.price_rub, None, 0
-
-    promo = await repo.get_promo(session, code)
-    if not promo or not promo.is_usable() or await repo.promo_used_by(session, promo.id, user.id):
-        await state.update_data(promo_code=None)
-        return plan.price_rub, None, 0
-
-    price = round(plan.price_rub * (100 - promo.discount_percent) / 100, 2)
-    return max(price, 1.0), promo.code, promo.bonus_days
-
-
 @router.callback_query(ikb.PayCB.filter())
 async def cb_pay(
     callback: CallbackQuery,
     callback_data: ikb.PayCB,
     session: AsyncSession,
     user: User,
-    state: FSMContext,
     bot: Bot,
 ) -> None:
     plan = await repo.get_plan(session, callback_data.plan_id)
@@ -60,17 +40,13 @@ async def cb_pay(
         return
 
     method = callback_data.method
-    price, promo_code, bonus_days = await _apply_promo(session, state, user, plan)
-    days = plan.days + bonus_days
+    price, days = plan.price_rub, plan.days
 
-    if method == "balance":
-        await _pay_from_balance(callback, session, user, plan, price, days, promo_code, bot)
-        return
     if method == "stars":
-        await _pay_with_stars(callback, session, user, plan, price, days, promo_code, bot)
+        await _pay_with_stars(callback, session, user, plan, price, days, bot)
         return
     if method == "sbp":
-        await _pay_sbp(callback, session, user, plan, price, days, promo_code)
+        await _pay_sbp(callback, session, user, plan, price, days)
         return
 
     provider = get_provider(method)
@@ -79,7 +55,7 @@ async def cb_pay(
         return
 
     payment = await repo.create_payment(
-        session, user.id, plan, provider=method, amount=price, days=days, promo_code=promo_code
+        session, user.id, plan, provider=method, amount=price, days=days
     )
     try:
         invoice = await provider.create_invoice(
@@ -118,7 +94,6 @@ async def _pay_with_stars(
     plan: Plan,
     price: float,
     days: int,
-    promo_code: Optional[str],
     bot: Bot,
 ) -> None:
     stars = rub_to_stars(price)
@@ -130,7 +105,6 @@ async def _pay_with_stars(
         amount=price,
         currency="XTR",
         days=days,
-        promo_code=promo_code,
     )
     await bot.send_invoice(
         chat_id=callback.message.chat.id,
@@ -141,45 +115,6 @@ async def _pay_with_stars(
         currency="XTR",
         prices=[LabeledPrice(label=f"Подписка {plan.title}", amount=stars)],
     )
-    await callback.answer()
-
-
-async def _pay_from_balance(
-    callback: CallbackQuery,
-    session: AsyncSession,
-    user: User,
-    plan: Plan,
-    price: float,
-    days: int,
-    promo_code: Optional[str],
-    bot: Bot,
-) -> None:
-    if (user.balance or 0) < price:
-        await callback.answer("На балансе недостаточно средств", show_alert=True)
-        return
-
-    user.balance = round(user.balance - price, 2)
-    payment = await repo.create_payment(
-        session, user.id, plan, provider="balance", amount=price, days=days, promo_code=promo_code
-    )
-    await session.commit()
-
-    try:
-        await subscriptions.complete_payment(session, bot, payment)
-    except VpnPanelError as exc:
-        # панель не ответила — возвращаем деньги на баланс, чтобы списание не повисло
-        log.error("Панель недоступна при оплате с баланса: %s", exc)
-        user.balance = round(user.balance + price, 2)
-        payment.status = PaymentStatus.failed
-        await session.commit()
-        await callback.message.answer(
-            "⚠️ Сервер выдачи ключей недоступен, средства возвращены на баланс. "
-            "Попробуйте через несколько минут."
-        )
-        await callback.answer()
-        return
-
-    await callback.message.edit_text("✅ Оплачено с баланса. Подписка продлена!")
     await callback.answer()
 
 
@@ -195,10 +130,9 @@ async def _pay_sbp(
     plan: Plan,
     price: float,
     days: int,
-    promo_code: Optional[str],
 ) -> None:
     payment = await repo.create_payment(
-        session, user.id, plan, provider="sbp", amount=price, days=days, promo_code=promo_code
+        session, user.id, plan, provider="sbp", amount=price, days=days
     )
     payment.external_id = sbp_code(payment.id)
     await session.commit()
@@ -319,7 +253,7 @@ async def pre_checkout(query: PreCheckoutQuery) -> None:
 
 @router.message(F.successful_payment)
 async def on_successful_payment(
-    message: Message, session: AsyncSession, bot: Bot, state: FSMContext
+    message: Message, session: AsyncSession, bot: Bot
 ) -> None:
     sp = message.successful_payment
     payload = sp.invoice_payload or ""
@@ -343,7 +277,6 @@ async def on_successful_payment(
         log.error("Панель недоступна после оплаты %s: %s", payment.id, exc)
         await message.answer(ru.ERROR_PANEL)
         return
-    await state.update_data(promo_code=None)
 
 
 # ---------------------------------------------------------------- ручная проверка

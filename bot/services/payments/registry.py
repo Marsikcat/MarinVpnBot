@@ -11,14 +11,13 @@ METHOD_TITLES: Dict[str, str] = {
     "yookassa": "💳 Банковская карта",
     "sbp": "🏦 СБП (перевод по номеру)",
     "cryptobot": "🪙 Криптовалюта",
-    "balance": "👛 С баланса",
 }
 
 _providers: Dict[str, PaymentProvider] = {}
 
 
 def get_provider(code: str) -> Optional[PaymentProvider]:
-    """Возвращает провайдера с внешним API (stars и balance обрабатываются в хендлерах)."""
+    """Возвращает провайдера с внешним API (stars и СБП обрабатываются в хендлерах)."""
     if code in _providers:
         return _providers[code]
 

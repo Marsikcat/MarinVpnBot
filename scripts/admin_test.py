@@ -22,7 +22,7 @@ os.environ["BOT_TOKEN"] = "123456:TEST"
 os.environ["ADMIN_IDS"] = "555"
 os.environ["TRIAL_ENABLED"] = "true"
 os.environ["TRIAL_DAYS"] = "3"
-os.environ["REFERRAL_PERCENT"] = "20"
+os.environ["DEFAULT_TRAFFIC_GB"] = "20"
 os.environ["PAY_STARS_ENABLED"] = "true"
 os.environ["PAY_SBP_ENABLED"] = "false"
 if DB_FILE.exists():
@@ -198,18 +198,18 @@ async def main() -> None:
     await asyncio.sleep(PAUSE)
     await dp.feed_update(bot, click(ikb.SettingCB(action="list").pack()))
     labels = buttons(last("EditMessageText"))
-    check(any("Реферальный процент: 20" in b for b in labels), "видно текущее значение из .env")
+    check(any(b.startswith("Лимит трафика по умолчанию") and b.endswith(": 20") for b in labels), "видно текущее значение из .env")
 
     await asyncio.sleep(PAUSE)
-    await dp.feed_update(bot, click(ikb.SettingCB(action="edit", key="referral_percent").pack()))
+    await dp.feed_update(bot, click(ikb.SettingCB(action="edit", key="default_traffic_gb").pack()))
     await asyncio.sleep(PAUSE)
-    await dp.feed_update(bot, message("150"))
-    check("Допустимо" in last("SendMessage").get("text", ""), "процент больше 100 отклонён")
+    await dp.feed_update(bot, message("999999"))
+    check("Допустимо" in last("SendMessage").get("text", ""), "значение вне диапазона отклонено")
     await asyncio.sleep(PAUSE)
     await dp.feed_update(bot, message("35"))
-    check(runtime.referral_percent == 35, "процент изменён в рантайме")
+    check(runtime.default_traffic_gb == 35, "значение изменено в рантайме")
     async with session_factory() as session:
-        check(await repo.get_setting(session, "referral_percent") == "35", "значение записано в БД")
+        check(await repo.get_setting(session, "default_traffic_gb") == "35", "значение записано в БД")
 
     # значение переживает перезапуск: новый объект Runtime читает его из БД
     from bot.services.runtime import Runtime
@@ -217,7 +217,7 @@ async def main() -> None:
     fresh = Runtime()
     async with session_factory() as session:
         await fresh.load(session)
-    check(fresh.referral_percent == 35, "после перезапуска значение берётся из БД")
+    check(fresh.default_traffic_gb == 35, "после перезапуска значение берётся из БД")
 
     print("\nПереключатели и отмена")
     await asyncio.sleep(PAUSE)

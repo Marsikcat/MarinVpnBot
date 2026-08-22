@@ -92,7 +92,7 @@ def render_plan(plan, subscription: Optional[Subscription] = None) -> str:
     return text
 
 
-def render_profile(user, subscription: Optional[Subscription], referrals: int) -> str:
+def render_profile(user, subscription: Optional[Subscription]) -> str:
     status = ru.subscription_status_line(
         subscription.expires_at if subscription else None,
         bool(subscription and subscription.is_active),
@@ -100,16 +100,5 @@ def render_profile(user, subscription: Optional[Subscription], referrals: int) -
     return ru.PROFILE.format(
         id=user.id,
         status=status,
-        balance=user.balance or 0,
-        referrals=referrals,
-        earned=user.referral_earned or 0,
-    )
-
-
-def render_referral(user, link: str, count: int) -> str:
-    return ru.REFERRAL.format(
-        percent=runtime.referral_percent,
-        link=link,
-        count=count,
-        earned=user.referral_earned or 0,
+        registered=f"{user.created_at:%d.%m.%Y}",
     )
