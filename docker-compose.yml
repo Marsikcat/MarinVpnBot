@@ -1,0 +1,30 @@
+services:
+  bot:
+    build: .
+    container_name: vpn-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    # Порт нужен только при WEBHOOK_ENABLED=true (колбэки ЮKassa / CryptoBot).
+    # Бот работает на long polling, наружу ничего открывать не требуется.
+    # ports:
+    #   - "8080:8080"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Postgres нужен только если в .env указан DATABASE_URL=postgresql+asyncpg://...
+  # По умолчанию бот работает на SQLite и этот сервис можно не запускать.
+  # db:
+  #   image: postgres:16-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: vpnbot
+  #     POSTGRES_PASSWORD: change-me
+  #     POSTGRES_DB: vpnbot
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+
+# volumes:
+#   pgdata:

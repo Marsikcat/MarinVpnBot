@@ -1,0 +1,25 @@
+[Unit]
+Description=Telegram VPN subscription bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpnbot
+WorkingDirectory=/opt/vpn-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/vpn-bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# базовая изоляция
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/vpn-bot/data
+
+[Install]
+WantedBy=multi-user.target

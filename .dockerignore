@@ -1,0 +1,15 @@
+.venv/
+venv/
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+*.log
+.idea/
+.vscode/
+README.md
