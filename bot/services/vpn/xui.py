@@ -18,7 +18,7 @@ import re
 import secrets
 import uuid as uuid_lib
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlparse
 
 import aiohttp
@@ -67,7 +67,10 @@ class XuiPanel(VpnPanel):
         self._logged_in = False
         self._logged_at: Optional[datetime] = None
         self._csrf: Optional[str] = None
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # вход в панель
+        # Клиенты пишутся перезаписью inbound'а целиком (прочитали — поменяли — записали).
+        # Две записи вперемешку затёрли бы друг друга: один из клиентов пропал бы из панели.
+        self._write_lock = asyncio.Lock()
         self._host = urlparse(self.base_url).hostname or "127.0.0.1"
 
     # ------------------------------------------------------------ HTTP
@@ -364,28 +367,29 @@ class XuiPanel(VpnPanel):
     async def create_or_update(
         self, username: str, expires_at: datetime, data_limit: int = 0, note: str = ""
     ) -> VpnAccount:
-        inbounds = await self._fetch_inbounds()
-        identity = self._identity(inbounds, username)
-        identity.setdefault("uuid", identity.get("id") or str(uuid_lib.uuid4()))
-        identity.setdefault("password", identity.get("auth") or self._secret())
-        identity.setdefault("subId", self._secret())
-
         tg_id = 0
         digits = re.search(r"\d+", note or "")
         if digits:
             tg_id = int(digits.group())
-
         expiry_ms = _to_ms(expires_at)
         links: List[str] = []
-        for inbound in inbounds:
-            clients = [c for c in self._clients(inbound) if c.get("email") != username]
-            client = self._build_client(inbound, username, identity, expiry_ms, data_limit, tg_id)
-            clients.append(client)
-            self._set_clients(inbound, clients)
-            await self._save_inbound(inbound)
-            link = self._build_link(inbound, client)
-            if link:
-                links.append(link)
+
+        async with self._write_lock:
+            inbounds = await self._fetch_inbounds()
+            identity = self._identity(inbounds, username)
+            identity.setdefault("uuid", identity.get("id") or str(uuid_lib.uuid4()))
+            identity.setdefault("password", identity.get("auth") or self._secret())
+            identity.setdefault("subId", self._secret())
+
+            for inbound in inbounds:
+                clients = [c for c in self._clients(inbound) if c.get("email") != username]
+                client = self._build_client(inbound, username, identity, expiry_ms, data_limit, tg_id)
+                clients.append(client)
+                self._set_clients(inbound, clients)
+                await self._save_inbound(inbound)
+                link = self._build_link(inbound, client)
+                if link:
+                    links.append(link)
 
         log.info("3x-ui: клиент %s выдан в %s inbound'ах", username, len(inbounds))
         return VpnAccount(
@@ -400,7 +404,13 @@ class XuiPanel(VpnPanel):
         )
 
     async def get(self, username: str) -> Optional[VpnAccount]:
-        inbounds = await self._fetch_inbounds()
+        return self._account(await self._fetch_inbounds(), username)
+
+    async def get_many(self, usernames: Sequence[str]) -> Dict[str, Optional[VpnAccount]]:
+        inbounds = await self._fetch_inbounds()  # один запрос на всех
+        return {username: self._account(inbounds, username) for username in usernames}
+
+    def _account(self, inbounds: List[Dict[str, Any]], username: str) -> Optional[VpnAccount]:
         links: List[str] = []
         found: Optional[Dict[str, Any]] = None
         for inbound in inbounds:
@@ -426,13 +436,14 @@ class XuiPanel(VpnPanel):
         )
 
     async def _update_clients(self, username: str, mutate) -> None:
-        for inbound in await self._fetch_inbounds():
-            clients = self._clients(inbound)
-            changed, new_clients = mutate(clients)
-            if not changed:
-                continue
-            self._set_clients(inbound, new_clients)
-            await self._save_inbound(inbound)
+        async with self._write_lock:
+            for inbound in await self._fetch_inbounds():
+                clients = self._clients(inbound)
+                changed, new_clients = mutate(clients)
+                if not changed:
+                    continue
+                self._set_clients(inbound, new_clients)
+                await self._save_inbound(inbound)
 
     async def set_enabled(self, username: str, enabled: bool) -> None:
         def mutate(clients: List[Dict[str, Any]]) -> Tuple[bool, List[Dict[str, Any]]]:

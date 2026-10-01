@@ -12,7 +12,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommand
 
 from bot.config import settings
 from bot.db.session import dispose_db, init_db, session_factory
-from bot.handlers import build_router
+from bot.handlers import build_router, common
 from bot.middlewares.db import DbSessionMiddleware
 from bot.middlewares.throttling import ThrottlingMiddleware
 from bot.middlewares.user import UserMiddleware
@@ -52,6 +52,7 @@ def create_dispatcher() -> Dispatcher:
     dp.callback_query.middleware(ThrottlingMiddleware(rate=0.3))
 
     dp.include_router(build_router())
+    dp.errors.register(common.on_error)
     return dp
 
 

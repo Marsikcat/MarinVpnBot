@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware
-from aiogram.types import CallbackQuery, TelegramObject
+from aiogram.types import CallbackQuery, Message, TelegramObject
 
 
 class ThrottlingMiddleware(BaseMiddleware):
@@ -22,6 +22,10 @@ class ThrottlingMiddleware(BaseMiddleware):
     ) -> Any:
         tg_user = data.get("event_from_user")
         if tg_user is None:
+            return await handler(event, data)
+        if isinstance(event, Message) and event.successful_payment:
+            # это не флуд, а сообщение Telegram об оплате: отбросить его — значит
+            # списать звёзды и не выдать подписку
             return await handler(event, data)
 
         now = time.monotonic()

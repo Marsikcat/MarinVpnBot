@@ -16,6 +16,7 @@ from bot.services import subscriptions
 from bot.services.payments.base import PaymentError
 from bot.services.payments.registry import get_provider
 from bot.services.vpn.base import VpnPanelError
+from bot.services.vpn.factory import get_panel
 from bot.texts import ru
 from bot.utils.render import time_left
 
@@ -60,10 +61,12 @@ async def deactivate_expired(bot: Bot, session_factory: async_sessionmaker) -> N
 
         for subscription in await repo.subscriptions_expired(session):
             try:
-                await subscriptions.disable(session, subscription)
+                expired = await subscriptions.expire_if_due(session, subscription)
             except VpnPanelError as exc:
-                log.error("Не удалось отключить %s: %s", subscription.vpn_username, exc)
-                continue
+                log.warning("Панель недоступна, отключение просроченных отложено: %s", exc)
+                break
+            if not expired:
+                continue  # срок продлили в панели или оплатили продление
             if not subscription.notified_expired:
                 try:
                     await bot.send_message(subscription.user_id, ru.EXPIRED, reply_markup=markup)
@@ -79,13 +82,18 @@ async def deactivate_expired(bot: Bot, session_factory: async_sessionmaker) -> N
 async def sync_with_panel(session_factory: async_sessionmaker) -> None:
     """Сверяет подписки с панелью: трафик, срок и включённость."""
     async with session_factory() as session:
-        for subscription in await repo.active_subscriptions(session):
-            try:
-                await subscriptions.sync_usage(session, subscription)
-            except VpnPanelError as exc:
-                log.warning("Синхронизация %s: %s", subscription.vpn_username, exc)
-                return
-            await asyncio.sleep(0.05)
+        active = await repo.active_subscriptions(session)
+        if not active:
+            return
+        try:
+            # один запрос к панели на всех, а не по запросу на каждого клиента
+            accounts = await get_panel().get_many([s.vpn_username for s in active])
+        except VpnPanelError as exc:
+            log.warning("Сверка с панелью пропущена — панель недоступна: %s", exc)
+            return
+        for subscription in active:
+            subscriptions.apply_account(subscription, accounts.get(subscription.vpn_username))
+        await session.commit()
 
 
 async def poll_pending_payments(bot: Bot, session_factory: async_sessionmaker) -> None:

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
 from sqlalchemy import and_, func, not_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import (
@@ -44,7 +45,16 @@ async def get_or_create_user(
 
     user = User(id=user_id, username=username, first_name=first_name)
     session.add(user)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # первые апдейты нового пользователя обрабатываются параллельно — запись
+        # успел создать соседний обработчик, берём её
+        await session.rollback()
+        existing = await session.get(User, user_id)
+        if existing is None:
+            raise
+        return existing, False
     return user, True
 
 

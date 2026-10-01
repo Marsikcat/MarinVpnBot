@@ -1,13 +1,10 @@
 """Формирование текстов, зависящих от состояния подписки."""
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Optional
 
-from datetime import timedelta
-
 from bot.db.models import Subscription, SubscriptionStatus, utcnow
-from bot.services.runtime import runtime
-from bot.services.subscriptions import parse_links
 from bot.texts import ru
 
 
@@ -38,7 +35,12 @@ def render_access(subscription: Optional[Subscription]) -> str:
 
     # доступ выключили в панели, хотя срок ещё не вышел
     if subscription.status == SubscriptionStatus.disabled and subscription.expires_at > utcnow():
-        return ru.SUBSCRIPTION_DISABLED.format(until=f"{subscription.expires_at:%d.%m.%Y}")
+        until = f"{subscription.expires_at:%d.%m.%Y}"
+        limit = subscription.traffic_limit
+        if limit and subscription.traffic_used >= limit:
+            # панель отключает клиента, когда кончился трафик, — это лечится продлением
+            return ru.SUBSCRIPTION_TRAFFIC_OUT.format(until=until, traffic=traffic_line(subscription))
+        return ru.SUBSCRIPTION_DISABLED.format(until=until)
 
     if not subscription.is_active:
         return ru.SUBSCRIPTION_EXPIRED.format(until=f"{subscription.expires_at:%d.%m.%Y}")
@@ -58,7 +60,9 @@ def plans_header(subscription: Optional[Subscription]) -> str:
     """Заголовок витрины: покупка, продление или возобновление."""
     if subscription is None:
         return ru.PLANS_HEADER
-    if subscription.is_active:
+    # Продление считается от оставшегося срока, даже если доступ сейчас приостановлен
+    # (например, кончился трафик), — показываем то же, что потом и случится.
+    if subscription.expires_at > utcnow():
         return ru.PLANS_HEADER_RENEW.format(
             until=f"{subscription.expires_at:%d.%m.%Y}",
             left=time_left(subscription),
@@ -82,10 +86,13 @@ def render_plan(plan, subscription: Optional[Subscription] = None) -> str:
 
     # при продлении сразу показываем, до какой даты продлится доступ
     if subscription is not None:
-        base = subscription.expires_at if subscription.is_active else utcnow()
+        # та же база, что и при выдаче: остаток срока, а если он вышел — сегодня
+        now = utcnow()
+        running = subscription.expires_at > now
+        base = subscription.expires_at if running else now
         tail = "\nВыберите способ оплаты:"
         renew_line = ru.PLAN_RENEW_LINE.format(
-            until_now=f"{subscription.expires_at:%d.%m.%Y}" if subscription.is_active else "истекла",
+            until_now=f"{subscription.expires_at:%d.%m.%Y}" if running else "истекла",
             until_new=f"{base + timedelta(days=plan.days):%d.%m.%Y}",
         )
         text = text.replace(tail, renew_line + tail)

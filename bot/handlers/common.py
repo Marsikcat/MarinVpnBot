@@ -4,17 +4,15 @@ from __future__ import annotations
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ErrorEvent, Message
 
-from bot.config import settings
 from bot.db.models import User
 from bot.keyboards import inline as ikb
 from bot.keyboards import reply as rkb
-from bot.services.runtime import runtime
 from bot.texts import ru
-from bot.utils.links import clean_url
 from bot.utils.tg import edit_view
 
 log = logging.getLogger(__name__)
@@ -85,6 +83,23 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text("Отменено.")
     await callback.answer()
+
+
+async def on_error(event: ErrorEvent) -> bool:
+    """Непойманная ошибка в любом обработчике: пишем в лог и отвечаем пользователю.
+
+    Без этого кнопка просто «висела»: Telegram ждал ответа, а пользователь не видел ничего.
+    """
+    update = event.update
+    log.error("Ошибка при обработке апдейта %s", update.update_id, exc_info=event.exception)
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(ru.ERROR_GENERIC, show_alert=True)
+        elif update.message:
+            await update.message.answer(ru.ERROR_GENERIC)
+    except TelegramAPIError:
+        pass  # на запрос уже ответили или чат недоступен — лог уже есть
+    return True
 
 
 @router.message(Command("id"))

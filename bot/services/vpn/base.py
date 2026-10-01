@@ -4,7 +4,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
 
 class VpnPanelError(RuntimeError):
@@ -41,6 +41,13 @@ class VpnPanel(abc.ABC):
     @abc.abstractmethod
     async def get(self, username: str) -> Optional[VpnAccount]:
         """Возвращает аккаунт или None, если его нет в панели."""
+
+    async def get_many(self, usernames: Sequence[str]) -> Dict[str, Optional[VpnAccount]]:
+        """Несколько аккаунтов разом; None — аккаунта нет в панели.
+
+        По умолчанию — запрос на каждого; панели, где это дорого, переопределяют.
+        """
+        return {username: await self.get(username) for username in usernames}
 
     @abc.abstractmethod
     async def set_enabled(self, username: str, enabled: bool) -> None:

@@ -45,7 +45,11 @@ async def grant_trial(message: Message, session: AsyncSession, user: User, bot: 
         subscription = await subscriptions.grant_trial(session, user)
     except VpnPanelError as exc:
         log.error("Не удалось выдать триал %s: %s", user.id, exc)
-        await message.answer(ru.ERROR_PANEL)
+        await message.answer(ru.ERROR_PANEL_TRIAL)
+        return
+    if subscription is None:  # параллельное нажатие уже выдало триал
+        plans = await repo.list_plans(session)
+        await message.answer(ru.TRIAL_ALREADY, reply_markup=ikb.plans_kb(plans))
         return
 
     await message.answer("Готово! Обновил меню 👇", reply_markup=rkb.main_menu(show_trial=False))

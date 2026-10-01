@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -41,6 +40,10 @@ async def cb_pay(
         return
 
     method = callback_data.method
+    if method not in settings.enabled_payment_methods:
+        # кнопка из старого сообщения, а способ с тех пор выключили
+        await callback.answer("Способ оплаты сейчас недоступен", show_alert=True)
+        return
     price, days = plan.price_rub, plan.days
 
     if method == "stars":
@@ -251,7 +254,19 @@ async def cb_sbp_decide(
 
 # ---------------------------------------------------------------- Telegram Stars
 @router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery) -> None:
+async def pre_checkout(query: PreCheckoutQuery, session: AsyncSession) -> None:
+    """Последняя проверка перед списанием звёзд: счёт наш и ещё не оплачен."""
+    payment = None
+    payload = query.invoice_payload or ""
+    if payload.startswith(f"{STARS_PAYLOAD}:") and payload.split(":", 1)[1].isdigit():
+        payment = await repo.get_payment(session, int(payload.split(":", 1)[1]))
+    if payment is None or payment.user_id != query.from_user.id:
+        await query.answer(ok=False, error_message="Счёт не найден. Создайте новый в /buy.")
+        return
+    if payment.status == PaymentStatus.paid:
+        # повторная оплата того же счёта списала бы звёзды, ничего не продлив
+        await query.answer(ok=False, error_message="Этот счёт уже оплачен — подписка выдана.")
+        return
     await query.answer(ok=True)
 
 
@@ -272,8 +287,10 @@ async def on_successful_payment(
         await message.answer(ru.ERROR_GENERIC)
         return
 
-    payment.external_id = sp.telegram_payment_charge_id
-    await session.commit()
+    if payment.status != PaymentStatus.paid:
+        # charge_id нужен для возврата и для повторной выдачи, если панель не ответит
+        payment.external_id = sp.telegram_payment_charge_id
+        await session.commit()
 
     try:
         await subscriptions.complete_payment(session, bot, payment)

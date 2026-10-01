@@ -9,7 +9,7 @@ from datetime import timedelta
 from typing import Tuple, Union
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -272,6 +272,10 @@ async def _grant(raw: str, reply_to: Message, session: AsyncSession, bot: Bot) -
         return
 
     user_id, days = int(parts[0]), int(parts[1])
+    if days == 0 or abs(days) > 3650:
+        # огромное число дней роняло обработчик на переполнении даты
+        await reply_to.answer("Дней — от 1 до 3650 (со знаком минус — чтобы убавить срок).")
+        return
     target = await session.get(User, user_id)
     if target is None:
         await reply_to.answer("Пользователь не найден — он должен сначала запустить бота.")
@@ -286,11 +290,15 @@ async def _grant(raw: str, reply_to: Message, session: AsyncSession, bot: Bot) -
         return
 
     await reply_to.answer(f"✅ {target.title}: подписка до <b>{subscription.expires_at:%d.%m.%Y}</b>")
+    headline = (
+        f"🎁 Вам начислено <b>{days}</b> дн. подписки."
+        if days > 0
+        else "Срок подписки изменён администратором."
+    )
     try:
         await bot.send_message(
             user_id,
-            f"🎁 Вам начислено <b>{days}</b> дн. подписки.\n"
-            f"Доступ активен до <b>{subscription.expires_at:%d.%m.%Y}</b>.",
+            f"{headline}\nДоступ активен до <b>{subscription.expires_at:%d.%m.%Y}</b>.",
         )
     except TelegramAPIError:
         pass
@@ -326,14 +334,22 @@ async def do_broadcast(message: Message, session: AsyncSession, state: FSMContex
 
     sent = blocked = failed = 0
     for index, user_id in enumerate(user_ids, 1):
-        try:
-            await bot.send_message(user_id, text, disable_web_page_preview=True)
-            sent += 1
-        except TelegramForbiddenError:
-            blocked += 1
-        except TelegramAPIError as exc:
-            failed += 1
-            log.warning("Рассылка %s: %s", user_id, exc)
+        for attempt in range(2):
+            try:
+                await bot.send_message(user_id, text, disable_web_page_preview=True)
+                sent += 1
+            except TelegramRetryAfter as exc:
+                if attempt == 0:
+                    # Telegram просит подождать — ждём и повторяем, а не теряем получателя
+                    await asyncio.sleep(exc.retry_after + 1)
+                    continue
+                failed += 1
+            except TelegramForbiddenError:
+                blocked += 1
+            except TelegramAPIError as exc:
+                failed += 1
+                log.warning("Рассылка %s: %s", user_id, exc)
+            break
         if index % 25 == 0:
             await asyncio.sleep(1)  # держимся в лимитах Telegram
         else:
@@ -373,8 +389,16 @@ async def cmd_ban(message: Message, command: CommandObject, session: AsyncSessio
     target.is_banned = not target.is_banned
     await session.commit()
     subscription = await repo.get_subscription(session, target.id)
+    note = ""
     if subscription and target.is_banned:
         await subscriptions.disable(session, subscription)
+    elif subscription and subscription.expires_at > utcnow():
+        # бан отключал доступ — после разбана оплаченный срок должен снова работать
+        try:
+            await subscriptions.restore(session, subscription)
+            note = f"\nДоступ снова включён до {subscription.expires_at:%d.%m.%Y}."
+        except VpnPanelError as exc:
+            note = f"\n⚠️ Не удалось включить доступ в панели: <code>{exc}</code>"
     await message.answer(
-        f"{'🚫 Заблокирован' if target.is_banned else '✅ Разблокирован'}: {target.title}"
+        f"{'🚫 Заблокирован' if target.is_banned else '✅ Разблокирован'}: {target.title}{note}"
     )

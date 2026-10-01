@@ -1,10 +1,11 @@
 """Выдача, продление и отключение подписок — единая точка правды."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -22,10 +23,26 @@ from bot.db.models import (
 )
 from bot.services.runtime import runtime
 from bot.texts import ru
-from bot.services.vpn.base import VpnPanelError
+from bot.services.vpn.base import VpnAccount, VpnPanelError
 from bot.services.vpn.factory import get_panel
 
 log = logging.getLogger(__name__)
+
+_locks: Dict[int, asyncio.Lock] = {}
+
+
+def user_lock(user_id: int) -> asyncio.Lock:
+    """Очередь на изменения подписки одного пользователя.
+
+    Обработчики Telegram, вебхуки и фоновые задачи работают в одном цикле событий
+    параллельно. Без очереди два одновременных подтверждения платежа прибавили бы дни
+    дважды, а «Обновить данные» или отключение просрочки могли бы перезаписать только
+    что продлённый срок старым.
+    """
+    lock = _locks.get(user_id)
+    if lock is None:
+        lock = _locks[user_id] = asyncio.Lock()
+    return lock
 
 
 def vpn_username(user_id: int) -> str:
@@ -56,8 +73,28 @@ async def issue_or_extend(
     а если обе в прошлом, то от текущего момента. `reset_traffic` обнуляет расход,
     чтобы оплаченный период начинался с полного лимита трафика.
     """
+    async with user_lock(user.id):
+        return await _issue_or_extend(
+            session, user, days, plan=plan, is_trial=is_trial,
+            traffic_gb=traffic_gb, reset_traffic=reset_traffic,
+        )
+
+
+async def _issue_or_extend(
+    session: AsyncSession,
+    user: User,
+    days: int,
+    plan: Optional[Plan] = None,
+    is_trial: bool = False,
+    traffic_gb: Optional[int] = None,
+    reset_traffic: bool = False,
+) -> Subscription:
+    """Тело issue_or_extend. Вызывать только внутри user_lock(user.id)."""
     now = utcnow()
     subscription = await repo.get_subscription(session, user.id)
+    if subscription is not None:
+        # объект мог загрузиться до очереди — берём то, что записал предыдущий в ней
+        await session.refresh(subscription)
     panel = get_panel()
     username = vpn_username(user.id)
 
@@ -101,6 +138,12 @@ async def issue_or_extend(
 
     subscription.plan_id = plan.id if plan else subscription.plan_id
     subscription.status = SubscriptionStatus.active
+    if subscription.expires_at != expires_at:
+        # новый срок — напоминания об окончании пойдут заново; «Обновить данные»
+        # срок не меняет, и напоминать повторно незачем
+        subscription.notified_3d = False
+        subscription.notified_1d = False
+        subscription.notified_expired = False
     subscription.expires_at = expires_at
     subscription.traffic_limit = traffic_limit
     if reset_traffic:
@@ -110,9 +153,6 @@ async def issue_or_extend(
     if account.links:
         subscription.links = json.dumps(account.links, ensure_ascii=False)
     subscription.is_trial = is_trial  # платное продление снимает пометку триала
-    subscription.notified_3d = False
-    subscription.notified_1d = False
-    subscription.notified_expired = False
 
     if is_trial:
         user.trial_used = True
@@ -125,12 +165,45 @@ async def issue_or_extend(
 
 async def disable(session: AsyncSession, subscription: Subscription) -> None:
     """Отключает доступ в панели и помечает подписку истёкшей."""
-    try:
-        await get_panel().set_enabled(subscription.vpn_username, False)
-    except VpnPanelError as exc:
-        log.error("Не удалось отключить %s в панели: %s", subscription.vpn_username, exc)
-    subscription.status = SubscriptionStatus.expired
-    await session.commit()
+    async with user_lock(subscription.user_id):
+        try:
+            await get_panel().set_enabled(subscription.vpn_username, False)
+        except VpnPanelError as exc:
+            log.error("Не удалось отключить %s в панели: %s", subscription.vpn_username, exc)
+        subscription.status = SubscriptionStatus.expired
+        await session.commit()
+
+
+async def restore(session: AsyncSession, subscription: Subscription) -> None:
+    """Включает доступ обратно (например, после разбана). Срок не трогает."""
+    async with user_lock(subscription.user_id):
+        await get_panel().set_enabled(subscription.vpn_username, True)
+        subscription.status = SubscriptionStatus.active
+        await session.commit()
+
+
+async def expire_if_due(session: AsyncSession, subscription: Subscription) -> bool:
+    """Отключает доступ, если срок действительно вышел. True — подписка истекла сейчас.
+
+    Перед отключением сверяется с панелью: срок могли продлить там руками или оплатить
+    продление прямо в эту минуту — такого клиента отключать нельзя. Ошибку панели
+    пробрасывает: отключать вслепую незачем, панель сама не пускает клиентов
+    с истёкшим сроком, а задача повторится.
+    """
+    async with user_lock(subscription.user_id):
+        await session.refresh(subscription)
+        if subscription.status != SubscriptionStatus.active or subscription.expires_at > utcnow():
+            return False
+        account = await get_panel().get(subscription.vpn_username)
+        apply_account(subscription, account)
+        if subscription.is_active:
+            await session.commit()
+            return False
+        if account is not None and account.enabled:
+            await get_panel().set_enabled(subscription.vpn_username, False)
+        subscription.status = SubscriptionStatus.expired
+        await session.commit()
+        return True
 
 
 async def sync_usage(session: AsyncSession, subscription: Subscription) -> Subscription:
@@ -139,19 +212,25 @@ async def sync_usage(session: AsyncSession, subscription: Subscription) -> Subsc
     Панель — источник правды: если срок или доступ поменяли там руками, бот это увидит
     и покажет пользователю реальное положение дел, а не своё представление о нём.
     """
-    try:
-        account = await get_panel().get(subscription.vpn_username)
-    except VpnPanelError as exc:
-        log.warning("Панель недоступна при синхронизации %s: %s", subscription.vpn_username, exc)
-        return subscription
+    async with user_lock(subscription.user_id):
+        try:
+            account = await get_panel().get(subscription.vpn_username)
+        except VpnPanelError as exc:
+            log.warning("Панель недоступна при синхронизации %s: %s", subscription.vpn_username, exc)
+            return subscription
+        apply_account(subscription, account)
+        await session.commit()
+    return subscription
 
+
+def apply_account(subscription: Subscription, account: Optional[VpnAccount]) -> None:
+    """Переносит в запись БД то, что сейчас в панели. Коммит — за вызывающим."""
     if account is None:
         # клиента удалили из панели — доступа фактически нет, каким бы ни был статус в БД
         if subscription.status != SubscriptionStatus.expired:
             log.warning("Клиент %s исчез из панели — помечаю подписку истёкшей", subscription.vpn_username)
             subscription.status = SubscriptionStatus.expired
-            await session.commit()
-        return subscription
+        return
 
     subscription.traffic_used = account.used_traffic
     if account.data_limit != subscription.traffic_limit:
@@ -171,44 +250,53 @@ async def sync_usage(session: AsyncSession, subscription: Subscription) -> Subsc
         )
         subscription.expires_at = account.expires_at
 
+    now = utcnow()
     if not account.enabled:
-        subscription.status = SubscriptionStatus.disabled
-    elif subscription.expires_at > utcnow():
+        # Истёкших клиентов 3x-ui отключает сам — это конец срока, а не «приостановка»:
+        # такую подписку оставляем deactivate_expired, она пометит её истёкшей и
+        # предупредит клиента. Приостановка — когда отключили при оставшемся сроке.
+        if subscription.expires_at > now:
+            subscription.status = SubscriptionStatus.disabled
+    elif subscription.expires_at > now:
         subscription.status = SubscriptionStatus.active
-
-    await session.commit()
-    return subscription
 
 
 async def complete_payment(session: AsyncSession, bot: Bot, payment: Payment) -> Optional[Subscription]:
     """Подтверждает платёж и выдаёт подписку. Идемпотентна: повторный вызов ничего не меняет."""
-    if payment.status == PaymentStatus.paid:
-        return await repo.get_subscription(session, payment.user_id)
+    async with user_lock(payment.user_id):
+        # Тот же платёж могли провести параллельно (вебхук и опрос, два нажатия админа):
+        # перечитываем статус уже в очереди, в свежей транзакции.
+        await session.commit()
+        await session.refresh(payment)
+        if payment.status == PaymentStatus.paid:
+            return await repo.get_subscription(session, payment.user_id)
 
-    user = await session.get(User, payment.user_id)
-    if user is None:
-        log.error("Платёж %s без пользователя %s", payment.id, payment.user_id)
-        return None
+        user = await session.get(User, payment.user_id)
+        if user is None:
+            log.error("Платёж %s без пользователя %s", payment.id, payment.user_id)
+            return None
 
-    plan = await session.get(Plan, payment.plan_id) if payment.plan_id else None
-    days = payment.days or (plan.days if plan else 0)
+        plan = await session.get(Plan, payment.plan_id) if payment.plan_id else None
+        days = payment.days or (plan.days if plan else 0)
 
-    # запоминаем состояние до выдачи, чтобы отличить продление от первой покупки
-    previous = await repo.get_subscription(session, user.id)
-    was_active = bool(previous and previous.is_active)
-    previous_until = previous.expires_at if previous else None
+        # запоминаем состояние до выдачи, чтобы отличить продление от первой покупки
+        previous = await repo.get_subscription(session, user.id)
+        if previous is not None:
+            await session.refresh(previous)
+        previous_until = previous.expires_at if previous else None
+        was_running = bool(previous_until and previous_until > utcnow())
 
-    # Сначала выдаём доступ: если панель недоступна, платёж останется pending
-    # и будет повторно обработан фоновой задачей — деньги не «сгорят».
-    # Оплаченный период начинается с полного лимита — израсходованное обнуляем.
-    subscription = await issue_or_extend(session, user, days=days, plan=plan, reset_traffic=True)
+        # Сначала выдаём доступ: если панель недоступна, платёж останется pending
+        # и будет повторно обработан фоновой задачей — деньги не «сгорят».
+        # Оплаченный период начинается с полного лимита — израсходованное обнуляем.
+        subscription = await _issue_or_extend(session, user, days=days, plan=plan, reset_traffic=True)
 
-    payment.status = PaymentStatus.paid
-    payment.paid_at = utcnow()
-    await session.commit()
+        payment.status = PaymentStatus.paid
+        payment.paid_at = utcnow()
+        await session.commit()
 
     plan_title = plan.title if plan else f"{days} дн."
-    if was_active and previous_until:
+    if was_running:
         header = ru.PAYMENT_DONE_RENEW.format(plan=plan_title, was=f"{previous_until:%d.%m.%Y}")
     else:
         header = ru.PAYMENT_DONE_NEW.format(plan=plan_title)
@@ -224,12 +312,17 @@ async def complete_payment(session: AsyncSession, bot: Bot, payment: Payment) ->
     return subscription
 
 
-async def grant_trial(session: AsyncSession, user: User) -> Subscription:
-    """Выдаёт пробный период. Проверку trial_used делает вызывающая сторона."""
-    return await issue_or_extend(
-        session,
-        user,
-        days=runtime.trial_days,
-        is_trial=True,
-        traffic_gb=runtime.trial_traffic_gb,
-    )
+async def grant_trial(session: AsyncSession, user: User) -> Optional[Subscription]:
+    """Выдаёт пробный период. None — если он уже был использован."""
+    async with user_lock(user.id):
+        # проверка в очереди: два быстрых нажатия «Пробный период» не выдадут его дважды
+        await session.refresh(user)
+        if user.trial_used:
+            return None
+        return await _issue_or_extend(
+            session,
+            user,
+            days=runtime.trial_days,
+            is_trial=True,
+            traffic_gb=runtime.trial_traffic_gb,
+        )

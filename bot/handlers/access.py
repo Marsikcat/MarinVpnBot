@@ -87,6 +87,15 @@ async def cb_refresh(callback: CallbackQuery, session: AsyncSession, user: User)
     if subscription is None:
         await callback.answer(ru.NO_SUBSCRIPTION.format(trial_hint=""), show_alert=True)
         return
+    # Перевыдача включает клиента в панели. Для истёкшей подписки или отключённой
+    # админом это открыло бы доступ без оплаты, поэтому сначала смотрим, что в панели,
+    # и для неактивной подписки просто показываем её состояние.
+    subscription = await subscriptions.sync_usage(session, subscription)
+    if not subscription.is_active:
+        _, text, markup = await _load(session, user)
+        await edit_view(callback, text, markup)
+        await callback.answer()
+        return
 
     try:
         await subscriptions.issue_or_extend(

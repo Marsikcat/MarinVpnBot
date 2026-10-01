@@ -68,9 +68,12 @@ python -m bot.main
 ```bash
 python scripts/smoke_test.py    # БД, оплата, продление, истечение
 python scripts/dialog_test.py   # реальные апдейты Telegram через Dispatcher с подставным Bot
+python scripts/renew_test.py    # продление, сброс трафика, СБП из «Мой доступ»
+python scripts/admin_test.py    # редакторы тарифов и настроек
+python scripts/safety_test.py   # гонки и защитные проверки
 ```
 
-Оба скрипта работают на отдельных БД (`data/smoke.db`, `data/dialog.db`) и ничего не
+Скрипты работают на отдельных БД (`data/smoke.db`, `data/dialog.db` и т. д.) и ничего не
 отправляют наружу — их можно запускать на боевом сервере.
 
 ---
@@ -415,6 +418,8 @@ scripts/panel_check.py  диагностика VPN-панели
 scripts/renew_test.py   продление подписки и лимиты трафика
 scripts/admin_test.py   проверка админки: редактор тарифов и настроек
 scripts/smoke_test.py   сквозная проверка логики без Telegram
+scripts/safety_test.py  гонки и защитные проверки: двойные нажатия, просрочка, бан, ошибки
+scripts/migrate_legacy.py  чистка базы от столбцов рефералки и промокодов
 ```
 
 Добавить свою панель или платёжку — значит написать один класс: `VpnPanel`
