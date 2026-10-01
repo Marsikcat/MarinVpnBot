@@ -17,7 +17,7 @@ import logging
 import re
 import secrets
 import uuid as uuid_lib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
@@ -28,6 +28,9 @@ from bot.services.vpn.base import VpnAccount, VpnPanel, VpnPanelError
 
 log = logging.getLogger(__name__)
 CSRF_RE = re.compile(r'name="csrf-token"\s+content="([^"]+)"')
+# Cookie сессии 3x-ui живёт 6 часов; перелогиниваемся заметно раньше,
+# иначе панель начинает отвечать 404 на любой запрос к API.
+SESSION_TTL = timedelta(hours=1)
 
 UUID_PROTOCOLS = {"vless", "vmess"}
 PASSWORD_PROTOCOLS = {"trojan", "shadowsocks"}
@@ -58,6 +61,7 @@ class XuiPanel(VpnPanel):
         self.sub_base = settings.xui_sub_base.rstrip("/")
         self._session: Optional[aiohttp.ClientSession] = None
         self._logged_in = False
+        self._logged_at: Optional[datetime] = None
         self._csrf: Optional[str] = None
         self._lock = asyncio.Lock()
         self._host = urlparse(self.base_url).hostname or "127.0.0.1"
@@ -71,6 +75,7 @@ class XuiPanel(VpnPanel):
                 cookie_jar=aiohttp.CookieJar(unsafe=True),
             )
             self._logged_in = False
+            self._logged_at = None
         return self._session
 
     async def _fetch_csrf(self) -> Optional[str]:
@@ -85,9 +90,15 @@ class XuiPanel(VpnPanel):
         match = CSRF_RE.search(html)
         return match.group(1) if match else None
 
+    def _session_fresh(self) -> bool:
+        """Cookie панели живёт 6 часов, поэтому обновляем вход заранее."""
+        if not self._logged_in or self._logged_at is None:
+            return False
+        return (datetime.now(timezone.utc) - self._logged_at) < SESSION_TTL
+
     async def _login(self, force: bool = False) -> None:
         async with self._lock:
-            if self._logged_in and not force:
+            if self._session_fresh() and not force:
                 return
             session = await self._http()
             self._csrf = await self._fetch_csrf()
@@ -113,6 +124,7 @@ class XuiPanel(VpnPanel):
                     )
                 raise VpnPanelError(f"3x-ui: вход не выполнен — {payload.get('msg') or f'HTTP {status}'}")
             self._logged_in = True
+            self._logged_at = datetime.now(timezone.utc)
 
     async def _api(
         self, method: str, path: str, *, data: Any = None, retry_auth: bool = True, soft_404: bool = False
@@ -127,7 +139,10 @@ class XuiPanel(VpnPanel):
         except aiohttp.ClientError as exc:
             raise VpnPanelError(f"3x-ui: сеть недоступна ({exc})") from exc
 
-        if status in (401, 403) and retry_auth:
+        # Панель отвечает 404 и на протухшую сессию, и на несуществующий маршрут,
+        # поэтому один раз пробуем перелогиниться и повторить.
+        if retry_auth and (status in (401, 403) or (status == 404 and not soft_404)):
+            log.info("3x-ui: сессия недействительна (HTTP %s), вхожу заново", status)
             await self._login(force=True)
             return await self._api(method, path, data=data, retry_auth=False, soft_404=soft_404)
         if status == 404 and soft_404:
