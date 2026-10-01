@@ -35,7 +35,14 @@ async def show_plans(message: Message, session: AsyncSession, user: User) -> Non
 async def cb_plans(callback: CallbackQuery, session: AsyncSession, user: User) -> None:
     plans = await repo.list_plans(session)
     subscription = await repo.get_subscription(session, user.id)
-    await edit_view(callback, plans_header(subscription), ikb.plans_kb(plans))
+    text, markup = plans_header(subscription), ikb.plans_kb(plans)
+    if callback.message and callback.message.photo:
+        # «Продлить» под QR-кодом доступа: покупка идёт отдельным сообщением, чтобы QR
+        # со ссылкой остался на месте, а реквизиты СБП не оказались под картинкой,
+        # которую легко принять за платёжный QR.
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await edit_view(callback, text, markup)
     await callback.answer()
 
 

@@ -23,7 +23,8 @@ os.environ["BOT_TOKEN"] = "123456:TEST"
 os.environ["ADMIN_IDS"] = "555"
 os.environ["TRIAL_ENABLED"] = "false"
 os.environ["PAY_STARS_ENABLED"] = "true"
-os.environ["PAY_SBP_ENABLED"] = "false"
+os.environ["PAY_SBP_ENABLED"] = "true"
+os.environ["SBP_PHONE"] = "+7 900 000-00-00"
 os.environ["DEFAULT_TRAFFIC_GB"] = "0"
 if DB_FILE.exists():
     DB_FILE.unlink()
@@ -31,8 +32,9 @@ if DB_FILE.exists():
 from aiogram import Bot  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
+from aiogram.exceptions import TelegramBadRequest  # noqa: E402
 from aiogram.methods import TelegramMethod  # noqa: E402
-from aiogram.types import CallbackQuery, Chat, Message, Update, User as TgUser  # noqa: E402
+from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User as TgUser  # noqa: E402
 
 from bot.db import repo  # noqa: E402
 from bot.db.models import utcnow  # noqa: E402
@@ -50,11 +52,17 @@ PAUSE = 0.45
 GB = 1024 ** 3
 
 
+PHOTO_IDS: set = set()  # id сообщений-фото: у них нет текста, только подпись
+
+
 class FakeBot(Bot):
     async def __call__(self, method: TelegramMethod, request_timeout=None):
         CALLS.append((type(method).__name__, method.model_dump(exclude_none=True)))
         if type(method).__name__ == "GetMe":
             return TgUser(id=1, is_bot=True, first_name="bot", username="testbot")
+        if type(method).__name__ == "EditMessageText" and method.message_id in PHOTO_IDS:
+            # так отвечает настоящий Telegram
+            raise TelegramBadRequest(method, "Bad Request: there is no text in the message to edit")
         return True
 
 
@@ -76,6 +84,26 @@ def click(data: str, who: TgUser = USER) -> Update:
         chat=Chat(id=who.id, type="private"),
         from_user=who,
         text="меню",
+    )
+    return Update(
+        update_id=next(_ids),
+        callback_query=CallbackQuery(
+            id=str(next(_ids)), from_user=who, chat_instance="1", data=data, message=msg
+        ),
+    )
+
+
+def click_photo(data: str, who: TgUser = USER) -> Update:
+    """Нажатие кнопки под фото с QR-кодом — так выглядит «🔑 Мой доступ»."""
+    msg_id = next(_ids)
+    PHOTO_IDS.add(msg_id)
+    msg = Message(
+        message_id=msg_id,
+        date=datetime.now(timezone.utc),
+        chat=Chat(id=who.id, type="private"),
+        from_user=who,
+        photo=[PhotoSize(file_id="qr", file_unique_id="qr", width=512, height=512)],
+        caption="🔑 Ваш доступ",
     )
     return Update(
         update_id=next(_ids),
@@ -351,6 +379,52 @@ async def main() -> None:
         sub = await repo.get_subscription(session, USER.id)
         check(subscriptions.parse_links(sub) == links_before, "ключи прежние")
         check(sub.subscription_url == url_before, "ссылка-подписка прежняя")
+
+    print("\nПродление по СБП из «Мой доступ»")
+    async with session_factory() as session:
+        until_before = (await repo.get_subscription(session, USER.id)).expires_at
+    get_panel()._store[username].used_traffic = 4 * GB
+
+    # «Мой доступ» — фото с QR-кодом, «Продлить» нажимают под ним
+    await asyncio.sleep(PAUSE)
+    mark = len(CALLS)
+    await dp.feed_update(bot, click_photo(ikb.MenuCB(action="plans").pack()))
+    check("Продление подписки" in last("SendMessage").get("text", ""),
+          "«Продлить» под QR открывает тарифы новым сообщением")
+    check("EditMessageCaption" not in [n for n, _ in CALLS[mark:]], "сообщение с QR-кодом не тронуто")
+
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, click(ikb.PlanCB(plan_id=plan_id).pack()))
+    await asyncio.sleep(PAUSE)
+    mark = len(CALLS)
+    await dp.feed_update(bot, click(ikb.PayCB(method="sbp", plan_id=plan_id).pack()))
+    check("Оплата через СБП" in last("EditMessageText").get("text", ""), "счёт СБП показан")
+    check("AnswerCallbackQuery" in [n for n, _ in CALLS[mark:]], "кнопка СБП не зависает")
+
+    # сообщения, отправленные до исправления: кнопки оплаты остались под фото
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, click_photo(ikb.PayCB(method="sbp", plan_id=plan_id).pack()))
+    check("Оплата через СБП" in last("EditMessageCaption").get("caption", ""),
+          "из старого сообщения под фото счёт тоже открывается")
+
+    async with session_factory() as session:
+        pending = await repo.pending_payments(session, "sbp")
+        check(len(pending) == 2, "по счёту на каждое нажатие СБП")
+        payment_id = pending[0].id
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, click(ikb.SbpCB(action="claim", payment_id=payment_id).pack()))
+    check(last("EditMessageText").get("text") == ru.SBP_CLAIMED, "«Я перевёл» принято")
+    request = last("SendMessage")
+    check(request.get("chat_id") == ADMIN.id and "Заявка на оплату по СБП" in request.get("text", ""),
+          "администратору пришла заявка")
+
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, click(ikb.SbpCB(action="ok", payment_id=payment_id).pack(), ADMIN))
+    async with session_factory() as session:
+        sub = await repo.get_subscription(session, USER.id)
+        check(sub.expires_at.date() == (until_before + timedelta(days=plan_days)).date(),
+              "после подтверждения дни прибавились к остатку")
+    check(get_panel()._store[username].used_traffic == 0, "и трафик сброшен")
 
     print("\nПанель — источник правды")
     # админ вручную продлил клиента в панели — бот должен это увидеть

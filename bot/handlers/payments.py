@@ -1,4 +1,4 @@
-"""Оплата: Telegram Stars, ЮKassa, CryptoBot и списание с внутреннего баланса."""
+"""Оплата: Telegram Stars, СБП переводом по номеру, ЮKassa и CryptoBot."""
 from __future__ import annotations
 
 import logging
@@ -19,6 +19,7 @@ from bot.services.payments.registry import get_provider
 from bot.services.runtime import runtime
 from bot.services.vpn.base import VpnPanelError
 from bot.texts import ru
+from bot.utils.tg import edit_view
 
 log = logging.getLogger(__name__)
 router = Router(name="payments")
@@ -79,10 +80,10 @@ async def cb_pay(
         if provider.currency == "RUB"
         else f"{provider.convert(price)} {settings.cryptobot_asset.upper()} (≈{price:.0f} ₽)"
     )
-    await callback.message.edit_text(
+    await edit_view(
+        callback,
         ru.PAYMENT_CREATED.format(plan=plan.title, amount=amount_label),
-        reply_markup=ikb.invoice_kb(invoice.url, payment.id),
-        disable_web_page_preview=True,
+        ikb.invoice_kb(invoice.url, payment.id),
     )
     await callback.answer()
 
@@ -137,7 +138,10 @@ async def _pay_sbp(
     payment.external_id = sbp_code(payment.id)
     await session.commit()
 
-    await callback.message.edit_text(
+    # edit_view, а не edit_text: в старых сообщениях кнопки оплаты висят под фото с QR-кодом,
+    # а у фото нет текста — edit_text падает, и пользователь не видит ничего
+    await edit_view(
+        callback,
         ru.SBP_INVOICE.format(
             plan=plan.title,
             amount=price,
@@ -146,7 +150,7 @@ async def _pay_sbp(
             bank=f"Банк получателя: <b>{runtime.sbp_bank}</b>\n" if runtime.sbp_bank else "",
             receiver=f"Получатель: <b>{runtime.sbp_receiver}</b>\n" if runtime.sbp_receiver else "",
         ),
-        reply_markup=ikb.sbp_invoice_kb(payment.id),
+        ikb.sbp_invoice_kb(payment.id),
     )
     await callback.answer()
 
@@ -193,11 +197,11 @@ async def cb_sbp_claim(
             payment.id,
             settings.admin_ids,
         )
-        await callback.message.edit_text(ru.SBP_CLAIMED_OFFLINE.format(code=sbp_code(payment.id)))
+        await edit_view(callback, ru.SBP_CLAIMED_OFFLINE.format(code=sbp_code(payment.id)))
         await callback.answer()
         return
 
-    await callback.message.edit_text(ru.SBP_CLAIMED)
+    await edit_view(callback, ru.SBP_CLAIMED)
     await callback.answer()
 
 
@@ -312,7 +316,7 @@ async def cb_check(
             await callback.answer("Оплата принята, выдаём доступ…", show_alert=True)
             await callback.message.answer(ru.ERROR_PANEL)
             return
-        await callback.message.edit_text("✅ Оплата подтверждена. Подписка активна!")
+        await edit_view(callback, "✅ Оплата подтверждена. Подписка активна!")
         await callback.answer()
     elif status == "canceled":
         payment.status = PaymentStatus.canceled
