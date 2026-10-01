@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from aiogram import Bot
@@ -121,8 +121,27 @@ async def _issue_or_extend(
         # сбросит трафик ещё раз, но срок не прибавится дважды.
         await panel.reset_traffic(username)
 
-    account = await panel.create_or_update(
-        username=username,
+    return await _write(
+        session, user, subscription,
+        expires_at=expires_at, traffic_limit=traffic_limit,
+        plan=plan, is_trial=is_trial, reset_traffic=reset_traffic,
+    )
+
+
+async def _write(
+    session: AsyncSession,
+    user: User,
+    subscription: Optional[Subscription],
+    *,
+    expires_at: datetime,
+    traffic_limit: int,
+    plan: Optional[Plan] = None,
+    is_trial: bool = False,
+    reset_traffic: bool = False,
+) -> Subscription:
+    """Записывает срок и лимит сначала в панель, потом в БД. Только внутри user_lock."""
+    account = await get_panel().create_or_update(
+        username=vpn_username(user.id),
         expires_at=expires_at,
         data_limit=traffic_limit,
         note=f"tg:{user.id} {user.title}",
@@ -132,7 +151,7 @@ async def _issue_or_extend(
         subscription = Subscription(
             user_id=user.id,
             vpn_username=account.username,
-            started_at=now,
+            started_at=utcnow(),
         )
         session.add(subscription)
 
@@ -163,22 +182,63 @@ async def _issue_or_extend(
     return subscription
 
 
-async def disable(session: AsyncSession, subscription: Subscription) -> None:
-    """Отключает доступ в панели и помечает подписку истёкшей."""
-    async with user_lock(subscription.user_id):
-        try:
-            await get_panel().set_enabled(subscription.vpn_username, False)
-        except VpnPanelError as exc:
-            log.error("Не удалось отключить %s в панели: %s", subscription.vpn_username, exc)
-        subscription.status = SubscriptionStatus.expired
-        await session.commit()
-
-
 async def restore(session: AsyncSession, subscription: Subscription) -> None:
     """Включает доступ обратно (например, после разбана). Срок не трогает."""
     async with user_lock(subscription.user_id):
         await get_panel().set_enabled(subscription.vpn_username, True)
         subscription.status = SubscriptionStatus.active
+        await session.commit()
+
+
+async def suspend(session: AsyncSession, subscription: Subscription) -> None:
+    """Приостанавливает доступ, не трогая срок (админка). Вернуть — restore()."""
+    async with user_lock(subscription.user_id):
+        await get_panel().set_enabled(subscription.vpn_username, False)
+        subscription.status = SubscriptionStatus.disabled
+        await session.commit()
+
+
+async def set_expiry(session: AsyncSession, user: User, expires_at: datetime) -> Subscription:
+    """Ставит точную дату окончания (админка). Лимит трафика остаётся прежним.
+
+    Как и любая выдача, включает доступ в панели.
+    """
+    async with user_lock(user.id):
+        subscription = await repo.get_subscription(session, user.id)
+        if subscription is not None:
+            await session.refresh(subscription)
+            traffic_limit, is_trial = subscription.traffic_limit, subscription.is_trial
+        else:
+            traffic_limit, is_trial = int(runtime.default_traffic_gb) * 1024 ** 3, False
+        log.info("Срок %s выставлен вручную: %s", vpn_username(user.id), expires_at)
+        return await _write(
+            session, user, subscription,
+            expires_at=expires_at, traffic_limit=traffic_limit, is_trial=is_trial,
+        )
+
+
+async def set_traffic_limit(session: AsyncSession, user: User, traffic_gb: int) -> Subscription:
+    """Меняет лимит трафика (0 — безлимит), срок не трогает (админка)."""
+    async with user_lock(user.id):
+        subscription = await repo.get_subscription(session, user.id)
+        if subscription is None:
+            raise ValueError("у пользователя нет подписки")
+        await session.refresh(subscription)
+        # срок берём из панели: его могли поменять там руками, а сверка ещё не прошла
+        account = await get_panel().get(subscription.vpn_username)
+        expires_at = account.expires_at if account and account.expires_at else subscription.expires_at
+        return await _write(
+            session, user, subscription,
+            expires_at=expires_at, traffic_limit=int(traffic_gb) * 1024 ** 3,
+            is_trial=subscription.is_trial,
+        )
+
+
+async def reset_usage(session: AsyncSession, subscription: Subscription) -> None:
+    """Обнуляет израсходованный трафик в панели и в БД (админка)."""
+    async with user_lock(subscription.user_id):
+        await get_panel().reset_traffic(subscription.vpn_username)
+        subscription.traffic_used = 0
         await session.commit()
 
 
@@ -206,16 +266,21 @@ async def expire_if_due(session: AsyncSession, subscription: Subscription) -> bo
         return True
 
 
-async def sync_usage(session: AsyncSession, subscription: Subscription) -> Subscription:
+async def sync_usage(
+    session: AsyncSession, subscription: Subscription, *, strict: bool = False
+) -> Subscription:
     """Приводит запись в БД в соответствие с панелью.
 
     Панель — источник правды: если срок или доступ поменяли там руками, бот это увидит
     и покажет пользователю реальное положение дел, а не своё представление о нём.
+    `strict` — пробросить ошибку панели, а не молча оставить данные из БД.
     """
     async with user_lock(subscription.user_id):
         try:
             account = await get_panel().get(subscription.vpn_username)
         except VpnPanelError as exc:
+            if strict:
+                raise
             log.warning("Панель недоступна при синхронизации %s: %s", subscription.vpn_username, exc)
             return subscription
         apply_account(subscription, account)

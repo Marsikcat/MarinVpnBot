@@ -11,3 +11,4 @@ class AdminStates(StatesGroup):
     plan_field = State()      # ждём новое значение поля тарифа
     plan_new = State()        # ждём «название | дней | цена»
     setting_value = State()   # ждём новое значение настройки
+    client_input = State()    # карточка клиента: ждём дни, дату, лимит или текст сообщения

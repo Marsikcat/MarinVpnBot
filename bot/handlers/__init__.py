@@ -3,13 +3,24 @@ from __future__ import annotations
 
 from aiogram import Router
 
-from bot.handlers import access, admin, admin_config, common, payments, plans, profile, trial
+from bot.handlers import (
+    access,
+    admin,
+    admin_config,
+    admin_users,
+    common,
+    payments,
+    plans,
+    profile,
+    trial,
+)
 
 
 def build_router() -> Router:
     router = Router(name="root")
     router.include_router(common.cancel_router)
     router.include_router(admin.router)
+    router.include_router(admin_users.router)
     router.include_router(admin_config.router)
     router.include_router(common.router)
     router.include_router(trial.router)

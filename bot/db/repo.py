@@ -254,6 +254,20 @@ async def get_payment_by_external(session: AsyncSession, provider: str, external
     return await session.scalar(stmt)
 
 
+async def user_payments(session: AsyncSession, user_id: int, limit: int = 10) -> Sequence[Payment]:
+    stmt = select(Payment).where(Payment.user_id == user_id).order_by(Payment.id.desc()).limit(limit)
+    return list(await session.scalars(stmt))
+
+
+async def user_paid_total(session: AsyncSession, user_id: int) -> tuple[int, float]:
+    """Сколько раз и на какую сумму пользователь заплатил."""
+    stmt = select(func.count(), func.coalesce(func.sum(Payment.amount), 0.0)).where(
+        Payment.user_id == user_id, Payment.status == PaymentStatus.paid
+    )
+    count, total = (await session.execute(stmt)).one()
+    return int(count or 0), float(total or 0.0)
+
+
 async def pending_payments(session: AsyncSession, provider: str, older_than_minutes: int = 0) -> Sequence[Payment]:
     stmt = select(Payment).where(Payment.provider == provider, Payment.status == PaymentStatus.pending)
     if older_than_minutes:

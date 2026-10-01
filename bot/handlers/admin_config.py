@@ -5,14 +5,14 @@ import logging
 from typing import Dict, Union
 
 from aiogram import F, Router
-from aiogram.filters import BaseFilter, Command
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import settings
 from bot.db import repo
 from bot.db.models import Plan
+from bot.filters import IsAdmin
 from bot.keyboards import inline as ikb
 from bot.services.runtime import FIELDS, Field, ValidationError, parse, runtime
 from bot.states import AdminStates
@@ -20,12 +20,6 @@ from bot.texts import ru
 
 log = logging.getLogger(__name__)
 router = Router(name="admin_config")
-
-
-class IsAdmin(BaseFilter):
-    async def __call__(self, event: Union[Message, CallbackQuery]) -> bool:
-        user = event.from_user
-        return bool(user and settings.is_admin(user.id))
 
 
 router.message.filter(IsAdmin())

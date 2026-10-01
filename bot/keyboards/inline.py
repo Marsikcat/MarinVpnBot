@@ -8,7 +8,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import settings
-from bot.db.models import Plan
+from bot.db.models import Plan, Subscription, SubscriptionStatus, User
 from bot.services.runtime import runtime
 from bot.utils.links import clean_url
 
@@ -63,6 +63,14 @@ class SettingCB(CallbackData, prefix="setadm"):
 
     action: str
     key: str = ""
+
+
+class ClientCB(CallbackData, prefix="cli"):
+    """Карточка клиента: card | days | date | traffic | reset | suspend | resume |
+    trial | ban | pays | msg."""
+
+    action: str
+    user_id: int
 
 
 def plans_kb(plans: Sequence[Plan]) -> InlineKeyboardMarkup:
@@ -166,7 +174,7 @@ def admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📊 Статистика", callback_data=AdminCB(action="stats").pack()),
         InlineKeyboardButton(text="👥 Пользователи", callback_data=UsersCB(action="page").pack()),
     )
-    builder.row(InlineKeyboardButton(text="🔍 Найти юзера", callback_data=AdminCB(action="find").pack()))
+    builder.row(InlineKeyboardButton(text="🔍 Найти клиента", callback_data=AdminCB(action="find").pack()))
     builder.row(
         InlineKeyboardButton(text="💼 Тарифы", callback_data=PlanAdminCB(action="list").pack()),
         InlineKeyboardButton(text="⚙️ Настройки", callback_data=SettingCB(action="list").pack()),
@@ -184,8 +192,72 @@ def admin_kb() -> InlineKeyboardMarkup:
 SCOPE_TITLES = {"all": "Все", "active": "С подпиской", "inactive": "Без подписки"}
 
 
-def users_kb(page: int, pages: int, scope: str) -> InlineKeyboardMarkup:
+def _client_buttons(builder: InlineKeyboardBuilder, users: Sequence[User]) -> None:
+    """Кнопки «открыть карточку» по две в ряд."""
+    buttons = [
+        InlineKeyboardButton(
+            text=user.title[:32], callback_data=ClientCB(action="card", user_id=user.id).pack()
+        )
+        for user in users
+    ]
+    for start in range(0, len(buttons), 2):
+        builder.row(*buttons[start:start + 2])
+
+
+def clients_kb(users: Sequence[User]) -> InlineKeyboardMarkup:
+    """Выбор клиента из найденных."""
     builder = InlineKeyboardBuilder()
+    _client_buttons(builder, users)
+    return builder.as_markup()
+
+
+def client_card_kb(user: User, subscription: Optional[Subscription]) -> InlineKeyboardMarkup:
+    def button(text: str, action: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=ClientCB(action=action, user_id=user.id).pack())
+
+    builder = InlineKeyboardBuilder()
+    builder.row(button("➕ Дни", "days"), button("📅 Дата окончания", "date"))
+    if subscription is not None:
+        builder.row(button("📊 Лимит трафика", "traffic"), button("🔄 Сбросить трафик", "reset"))
+        if subscription.status == SubscriptionStatus.disabled:
+            builder.row(button("▶️ Возобновить доступ", "resume"))
+        elif subscription.is_active:
+            builder.row(button("⏸ Приостановить доступ", "suspend"))
+    builder.row(
+        button("🎁 Разрешить триал заново" if user.trial_used else "🎁 Запретить триал", "trial")
+    )
+    builder.row(button("✅ Разбанить" if user.is_banned else "🚫 Забанить", "ban"))
+    builder.row(button("💳 Платежи", "pays"), button("✉️ Написать", "msg"))
+    builder.row(
+        button("🔄 Обновить", "card"),
+        InlineKeyboardButton(text="👥 К списку", callback_data=UsersCB(action="page").pack()),
+    )
+    return builder.as_markup()
+
+
+def client_payments_kb(user_id: int, pending_sbp: Sequence[int]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for payment_id in pending_sbp:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"✅ Деньги пришли #{payment_id}",
+                callback_data=SbpCB(action="ok", payment_id=payment_id).pack(),
+            ),
+            InlineKeyboardButton(
+                text=f"❌ #{payment_id}", callback_data=SbpCB(action="no", payment_id=payment_id).pack()
+            ),
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ К клиенту", callback_data=ClientCB(action="card", user_id=user_id).pack()
+        )
+    )
+    return builder.as_markup()
+
+
+def users_kb(page: int, pages: int, scope: str, users: Sequence[User] = ()) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    _client_buttons(builder, users)
 
     nav = []
     if page > 0:

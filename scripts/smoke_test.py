@@ -36,6 +36,7 @@ from bot.db.models import PaymentStatus, SubscriptionStatus, utcnow  # noqa: E40
 from bot.db.session import init_db, session_factory  # noqa: E402
 from bot.services import subscriptions  # noqa: E402
 from bot.services.payments.base import rub_to_stars  # noqa: E402
+from bot.services.vpn.factory import get_panel  # noqa: E402
 
 
 class DummyBot:
@@ -96,13 +97,15 @@ async def main() -> None:
         revenue = await repo.total_revenue(session)
         check(revenue == plan.price_rub, "выручка учтена один раз")
 
-        # --- истечение подписки
+        # --- истечение подписки: срок вышел и в БД, и в панели — в жизни это одно состояние
         subscription.expires_at = utcnow() - timedelta(hours=1)
         await session.commit()
+        get_panel()._store[subscription.vpn_username].expires_at = subscription.expires_at
         expired = await repo.subscriptions_expired(session)
         check(len(expired) == 1, "просроченная подписка найдена планировщиком")
-        await subscriptions.disable(session, expired[0])
+        check(await subscriptions.expire_if_due(session, expired[0]), "планировщик её отключает")
         check(expired[0].status == SubscriptionStatus.expired, "доступ отключён")
+        check(not get_panel()._store[subscription.vpn_username].enabled, "и в панели тоже")
 
         # --- пересчёт в звёзды
         check(rub_to_stars(149) == 94, f"149 ₽ -> {rub_to_stars(149)} звёзд при курсе 1.6")

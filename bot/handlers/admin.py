@@ -3,21 +3,24 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import html
 import io
 import logging
 from datetime import timedelta
-from typing import Tuple, Union
+from typing import Tuple
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import BaseFilter, Command, CommandObject
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
 from bot.db import repo
 from bot.db.models import User, utcnow
+from bot.filters import IsAdmin
+from bot.handlers import admin_users
 from bot.keyboards import inline as ikb
 from bot.services import subscriptions
 from bot.services.runtime import runtime
@@ -28,12 +31,6 @@ from bot.utils.tg import edit_view
 
 log = logging.getLogger(__name__)
 router = Router(name="admin")
-
-
-class IsAdmin(BaseFilter):
-    async def __call__(self, event: Union[Message, CallbackQuery]) -> bool:
-        user = event.from_user
-        return bool(user and settings.is_admin(user.id))
 
 
 router.message.filter(IsAdmin())
@@ -107,7 +104,7 @@ def _user_line(index: int, user: User, subscription) -> str:
     return f"{index}. {user.title} (<code>{user.id}</code>) — {state}{extra}"
 
 
-async def _users_text(session: AsyncSession, page: int, scope: str) -> Tuple[str, int, int]:
+async def _users_view(session: AsyncSession, page: int, scope: str) -> Tuple[str, InlineKeyboardMarkup]:
     total = await repo.count_users_by_scope(session, scope)
     pages = max((total + PER_PAGE - 1) // PER_PAGE, 1)
     page = min(max(page, 0), pages - 1)
@@ -123,21 +120,24 @@ async def _users_text(session: AsyncSession, page: int, scope: str) -> Tuple[str
         f"Всего: <b>{total}</b>"
     )
     body = "\n".join(lines) if lines else "Пусто."
-    return f"{header}\n\n{body}", page, pages
+    if users:
+        body += "\n\nНажмите на клиента, чтобы открыть карточку."
+    return f"{header}\n\n{body}", ikb.users_kb(page, pages, scope, users)
 
 
 @router.message(Command("users"))
 async def cmd_users(message: Message, session: AsyncSession) -> None:
-    text, page, pages = await _users_text(session, 0, "all")
-    await message.answer(text, reply_markup=ikb.users_kb(page, pages, "all"))
+    text, markup = await _users_view(session, 0, "all")
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(ikb.UsersCB.filter(F.action.in_({"page", "scope"})))
 async def cb_users(
-    callback: CallbackQuery, callback_data: ikb.UsersCB, session: AsyncSession
+    callback: CallbackQuery, callback_data: ikb.UsersCB, session: AsyncSession, state: FSMContext
 ) -> None:
-    text, page, pages = await _users_text(session, callback_data.page, callback_data.scope)
-    await edit_view(callback, text, ikb.users_kb(page, pages, callback_data.scope))
+    await state.clear()  # «👥 К списку» из карточки — выходим из незаконченного ввода
+    text, markup = await _users_view(session, callback_data.page, callback_data.scope)
+    await edit_view(callback, text, markup)
     await callback.answer()
 
 
@@ -227,28 +227,7 @@ async def cb_find(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminStates.find_user)
 async def do_find(message: Message, session: AsyncSession, state: FSMContext) -> None:
     await state.clear()
-    users = await repo.find_users(session, message.text or "")
-    if not users:
-        await message.answer("Ничего не найдено.")
-        return
-
-    chunks = []
-    for found in users:
-        subscription = await repo.get_subscription(session, found.id)
-        status = "нет"
-        if subscription:
-            status = (
-                f"до {subscription.expires_at:%d.%m.%Y}"
-                f"{' (активна)' if subscription.is_active else ' (истекла)'}"
-            )
-        chunks.append(
-            f"<b>{found.title}</b>\n"
-            f"ID: <code>{found.id}</code>\n"
-            f"Подписка: {status}\n"
-            f"Триал: {'использован' if found.trial_used else 'не использован'}\n"
-            f"Регистрация: {found.created_at:%d.%m.%Y}"
-        )
-    await message.answer("\n\n".join(chunks))
+    await admin_users.show_search_results(message, session, message.text or "")
 
 
 # ---------------------------------------------------------------- выдача дней
@@ -386,19 +365,5 @@ async def cmd_ban(message: Message, command: CommandObject, session: AsyncSessio
     if target is None:
         await message.answer("Пользователь не найден.")
         return
-    target.is_banned = not target.is_banned
-    await session.commit()
-    subscription = await repo.get_subscription(session, target.id)
-    note = ""
-    if subscription and target.is_banned:
-        await subscriptions.disable(session, subscription)
-    elif subscription and subscription.expires_at > utcnow():
-        # бан отключал доступ — после разбана оплаченный срок должен снова работать
-        try:
-            await subscriptions.restore(session, subscription)
-            note = f"\nДоступ снова включён до {subscription.expires_at:%d.%m.%Y}."
-        except VpnPanelError as exc:
-            note = f"\n⚠️ Не удалось включить доступ в панели: <code>{exc}</code>"
-    await message.answer(
-        f"{'🚫 Заблокирован' if target.is_banned else '✅ Разблокирован'}: {target.title}{note}"
-    )
+    result = await admin_users.toggle_ban(session, target)
+    await message.answer(html.escape(result))

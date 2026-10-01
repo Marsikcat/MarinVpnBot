@@ -1,4 +1,4 @@
-"""Проверка админского интерфейса: редактор тарифов и редактор настроек.
+"""Проверка админского интерфейса: редакторы тарифов и настроек, карточка клиента.
 
 Гоняет настоящие апдейты Telegram через Dispatcher с подставным Bot, ничего
 не отправляя наружу. Работает на отдельной БД data/admin.db.
@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,6 +99,118 @@ def check(condition: bool, title: str) -> None:
     if not condition:
         print("      последние вызовы:", [n for n, _ in CALLS[-6:]])
         raise SystemExit(1)
+
+
+async def check_client_card(dp, bot) -> None:
+    """Карточка клиента: каждое действие меняет и панель, и базу."""
+    print("\nКарточка клиента")
+    from bot.db.models import SubscriptionStatus
+    from bot.handlers.admin_users import local_time
+    from bot.services import subscriptions
+    from bot.services.vpn.factory import get_panel
+
+    panel = get_panel()
+    login = subscriptions.vpn_username(CLIENT.id)
+    gb = 1024 ** 3
+
+    async def press(action: str) -> None:
+        await asyncio.sleep(PAUSE)
+        await dp.feed_update(bot, click(ikb.ClientCB(action=action, user_id=CLIENT.id).pack()))
+
+    async def send(text: str) -> None:
+        await asyncio.sleep(PAUSE)
+        await dp.feed_update(bot, message(text))
+
+    async def current():
+        async with session_factory() as session:
+            return await repo.get_subscription(session, CLIENT.id), await repo.get_user(session, CLIENT.id)
+
+    await send("/users")
+    check(any(b.startswith("@client") for b in buttons(last("SendMessage"))), "в списке клиенты — кнопками")
+
+    await send("/user @client")
+    card = last("SendMessage")
+    check("<code>900</code>" in card.get("text", "") and "активна" in card.get("text", ""),
+          "/user открывает карточку с подпиской")
+    wanted = {"➕ Дни", "📅 Дата окончания", "📊 Лимит трафика", "🔄 Сбросить трафик", "💳 Платежи", "✉️ Написать"}
+    check(wanted <= set(buttons(card)), "все действия на месте")
+
+    await send("/user i")
+    check("Найдено: <b>2</b>" in last("SendMessage").get("text", ""), "несколько найденных — выбор кнопками")
+    await send("/user nobody_here")
+    check("Ничего не найдено" in last("SendMessage").get("text", ""), "ненайденный — понятный ответ")
+
+    sub, _ = await current()
+    before = sub.expires_at
+    await press("days")
+    check("Сколько дней" in last("SendMessage").get("text", ""), "«Дни» спрашивает число")
+    await send("много")
+    check("целое число" in last("SendMessage").get("text", ""), "ерунда отклонена, ввод ждёт дальше")
+    await send("10")
+    sub, _ = await current()
+    check(sub.expires_at.date() == (before + timedelta(days=10)).date(), "+10 дней прибавились к остатку")
+    check(panel._store[login].expires_at == sub.expires_at, "в панели тот же срок")
+    check(sub.traffic_limit == 0, "лимит трафика не тронут")
+    check(any(p.get("chat_id") == CLIENT.id and "начислено" in p.get("text", "") for n, p in CALLS if n == "SendMessage"),
+          "клиент получил уведомление")
+    check("Подписка" in last("SendMessage").get("text", ""), "после правки снова показана карточка")
+
+    await press("date")
+    await send("32.13.2030")
+    check("Не понял дату" in last("SendMessage").get("text", ""), "неверная дата отклонена")
+    await send("31.12.2030")
+    sub, _ = await current()
+    check(local_time(sub.expires_at).startswith("31.12.2030 23:59"), "дата выставлена — до конца дня")
+    check(panel._store[login].expires_at == sub.expires_at, "и в панели")
+
+    await press("date")
+    await send("/cancel")
+    await send("01.01.2031")
+    sub, _ = await current()
+    check(local_time(sub.expires_at).startswith("31.12.2030"), "после /cancel ввод не применяется")
+
+    await press("traffic")
+    check("безлимит" in last("SendMessage").get("text", ""), "«Лимит трафика» показывает текущий")
+    await send("50")
+    sub, _ = await current()
+    check(sub.traffic_limit == 50 * gb and panel._store[login].data_limit == 50 * gb, "лимит 50 ГБ в базе и панели")
+    check(local_time(sub.expires_at).startswith("31.12.2030"), "срок при этом не тронут")
+
+    panel._store[login].used_traffic = 7 * gb
+    await press("reset")
+    check(panel._store[login].used_traffic == 0, "трафик сброшен в панели")
+
+    await press("suspend")
+    sub, _ = await current()
+    check(not panel._store[login].enabled and sub.status == SubscriptionStatus.disabled, "доступ приостановлен")
+    check("▶️ Возобновить доступ" in buttons(last("EditMessageText")), "в карточке появилась «Возобновить»")
+    await press("resume")
+    sub, _ = await current()
+    check(panel._store[login].enabled and sub.status == SubscriptionStatus.active, "доступ возобновлён")
+
+    _, user = await current()
+    trial_before = user.trial_used
+    await press("trial")
+    _, user = await current()
+    check(user.trial_used != trial_before, "отметку о триале можно переключить")
+    await press("trial")
+
+    await press("ban")
+    _, user = await current()
+    check(user.is_banned and not panel._store[login].enabled, "бан из карточки отключает доступ")
+    check("в бане" in last("EditMessageText").get("text", ""), "карточка показывает бан")
+    await press("ban")
+    _, user = await current()
+    check(not user.is_banned and panel._store[login].enabled, "разбан возвращает доступ")
+
+    await press("msg")
+    await send("Привет, это тест")
+    check(any(p.get("chat_id") == CLIENT.id and "Привет, это тест" in p.get("text", "")
+              for n, p in CALLS if n == "SendMessage"), "сообщение ушло клиенту от имени бота")
+
+    await press("pays")
+    payments = last("EditMessageText").get("text", "")
+    check("Платежи" in payments and "⏳ ждёт" in payments, "список платежей со статусами")
 
 
 async def main() -> None:
@@ -276,6 +388,8 @@ async def main() -> None:
     check(bool(document), "CSV отправлен файлом")
     check("2 пользователей" in document.get("caption", ""), "в подписи число выгруженных")
 
+    await check_client_card(dp, bot)
+
     print("\nПрава доступа")
     await asyncio.sleep(PAUSE)
     before = len(CALLS)
@@ -284,6 +398,11 @@ async def main() -> None:
     await asyncio.sleep(PAUSE)
     await dp.feed_update(bot, message("/settings", CLIENT))
     check(len(CALLS) == before, "и не открывает настройки")
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, click(ikb.ClientCB(action="days", user_id=CLIENT.id).pack(), CLIENT))
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, message(f"/user {CLIENT.id}", CLIENT))
+    check(len(CALLS) == before, "и не открывает карточки клиентов")
 
     await bot.session.close()
     print("\nАдминский интерфейс работает.")

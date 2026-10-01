@@ -12,8 +12,9 @@ def time_left(subscription: Subscription) -> str:
     seconds = subscription.seconds_left
     if seconds <= 0:
         return "истекла"
-    days = seconds // 86400
-    if days >= 1:
+    if seconds >= 86400:
+        # до ближайшего целого: сразу после покупки 30 дней — «30», а не «29»
+        days = (seconds + 43200) // 86400
         return f"осталось {ru.plural_days(days)}"
     hours = seconds // 3600
     if hours >= 1:

@@ -36,6 +36,8 @@ COMMANDS = [
 
 ADMIN_COMMANDS = COMMANDS + [
     BotCommand(command="admin", description="🛠 Админ-панель"),
+    BotCommand(command="user", description="👤 Карточка клиента: /user id или @ник"),
+    BotCommand(command="users", description="👥 Список клиентов"),
     BotCommand(command="plans", description="💼 Редактор тарифов"),
     BotCommand(command="settings", description="⚙️ Настройки бота"),
     BotCommand(command="claims", description="🏦 Заявки по СБП"),
