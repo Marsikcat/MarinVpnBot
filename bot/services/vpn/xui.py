@@ -46,6 +46,10 @@ def _to_ms(dt: datetime) -> int:
 def _from_ms(ms: Optional[int]) -> Optional[datetime]:
     if not ms:
         return None
+    ms = int(ms)
+    if ms < 0:
+        # «старт после первого подключения»: срок ещё не пошёл, в поле лежит длительность
+        return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(milliseconds=-ms)
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).replace(tzinfo=None)
 
 
@@ -334,12 +338,27 @@ class XuiPanel(VpnPanel):
 
     # ------------------------------------------------------------ трафик
     def _used_traffic(self, inbounds: List[Dict[str, Any]], email: str) -> int:
-        total = 0
+        # Статистика ведётся по email, а не по inbound'у: одна и та же запись приходит
+        # в clientStats каждого inbound'а. Сумма умножила бы расход на их число.
+        used = 0
         for inbound in inbounds:
             for stat in inbound.get("clientStats") or []:
                 if stat.get("email") == email:
-                    total += int(stat.get("up") or 0) + int(stat.get("down") or 0)
-        return total
+                    used = max(used, int(stat.get("up") or 0) + int(stat.get("down") or 0))
+        return used
+
+    def _expires_at(self, inbounds: List[Dict[str, Any]], email: str) -> Optional[datetime]:
+        """Самый поздний срок клиента: по всем inbound'ам, из настроек и из статистики.
+        Берём максимум, чтобы при продлении не потерять дни, выставленные только в одном месте."""
+        latest: Optional[datetime] = None
+        for inbound in inbounds:
+            values = [c.get("expiryTime") for c in self._clients(inbound) if c.get("email") == email]
+            values += [s.get("expiryTime") for s in inbound.get("clientStats") or [] if s.get("email") == email]
+            for value in values:
+                moment = _from_ms(value)
+                if moment and (latest is None or moment > latest):
+                    latest = moment
+        return latest
 
     # ------------------------------------------------------------ публичный интерфейс
     async def create_or_update(
@@ -400,7 +419,7 @@ class XuiPanel(VpnPanel):
             uuid=found.get("id"),
             subscription_url=self._sub_url(str(found.get("subId") or "")),
             links=links,
-            expires_at=_from_ms(found.get("expiryTime")),
+            expires_at=self._expires_at(inbounds, username),
             data_limit=int(found.get("totalGB") or 0),
             used_traffic=self._used_traffic(inbounds, username),
             enabled=bool(found.get("enable", True)),
@@ -435,12 +454,20 @@ class XuiPanel(VpnPanel):
         await self._update_clients(username, mutate)
 
     async def reset_traffic(self, username: str) -> None:
+        # Свежие сборки ведут клиентов отдельно от inbound'ов: сброс — одной ручкой по email.
+        payload = await self._api(
+            "POST", f"/panel/api/clients/resetTraffic/{quote(username, safe='')}", soft_404=True
+        )
+        if payload:
+            log.info("3x-ui: трафик %s сброшен", username)
+            return
+        # классические сборки: сброс в каждом inbound'е, где есть клиент
         for inbound in await self._fetch_inbounds():
-            await self._api(
-                "POST",
-                f"/panel/api/inbounds/{inbound['id']}/resetClientTraffic/{username}",
-                soft_404=True,
-            )
+            if self._find_client(inbound, username):
+                await self._api(
+                    "POST", f"/panel/api/inbounds/{inbound['id']}/resetClientTraffic/{username}"
+                )
+        log.info("3x-ui: трафик %s сброшен", username)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

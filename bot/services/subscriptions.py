@@ -48,33 +48,44 @@ async def issue_or_extend(
     plan: Optional[Plan] = None,
     is_trial: bool = False,
     traffic_gb: Optional[int] = None,
+    reset_traffic: bool = False,
 ) -> Subscription:
-    """Создаёт подписку или продлевает существующую и синхронизирует панель."""
+    """Создаёт подписку или продлевает существующую и синхронизирует панель.
+
+    Дни прибавляются к остатку: отсчёт идёт от самой поздней даты — в БД или в панели,
+    а если обе в прошлом, то от текущего момента. `reset_traffic` обнуляет расход,
+    чтобы оплаченный период начинался с полного лимита трафика.
+    """
     now = utcnow()
     subscription = await repo.get_subscription(session, user.id)
     panel = get_panel()
+    username = vpn_username(user.id)
 
-    # отсчитываем от того, что реально в панели: срок могли продлить или урезать там руками
-    base = now
-    if subscription and subscription.expires_at > now:
-        base = subscription.expires_at
-    try:
-        existing = await panel.get(vpn_username(user.id))
-    except VpnPanelError as exc:
-        log.warning("Панель не ответила перед выдачей %s: %s", user.id, exc)
-        existing = None
-    if existing and existing.expires_at and existing.expires_at > base:
-        log.info("Беру срок из панели для %s: %s", user.id, existing.expires_at)
-        base = existing.expires_at
+    # Срок могли продлить или урезать в панели руками, поэтому без её ответа не продлеваем:
+    # отсчёт от устаревшей даты в БД съел бы оставшиеся дни. Ошибка уходит наверх —
+    # платёж остаётся pending и будет проведён повторно.
+    existing = await panel.get(username)
 
+    db_until = subscription.expires_at if subscription else None
+    panel_until = existing.expires_at if existing else None
+    base = max(moment for moment in (now, db_until, panel_until) if moment is not None)
     expires_at = base + timedelta(days=days)
+    log.info(
+        "Срок %s: в БД %s, в панели %s -> от %s +%s дн. = %s",
+        username, db_until, panel_until, base, days, expires_at,
+    )
 
     if traffic_gb is None:
         traffic_gb = plan.traffic_gb if plan else 0
     traffic_limit = int(traffic_gb) * 1024 ** 3
 
+    if reset_traffic and existing is not None:
+        # Сбрасываем до продления: если продление сорвётся, повторная обработка платежа
+        # сбросит трафик ещё раз, но срок не прибавится дважды.
+        await panel.reset_traffic(username)
+
     account = await panel.create_or_update(
-        username=vpn_username(user.id),
+        username=username,
         expires_at=expires_at,
         data_limit=traffic_limit,
         note=f"tg:{user.id} {user.title}",
@@ -92,6 +103,8 @@ async def issue_or_extend(
     subscription.status = SubscriptionStatus.active
     subscription.expires_at = expires_at
     subscription.traffic_limit = traffic_limit
+    if reset_traffic:
+        subscription.traffic_used = 0
     subscription.vpn_uuid = account.uuid or subscription.vpn_uuid
     subscription.subscription_url = account.subscription_url or subscription.subscription_url
     if account.links:
@@ -187,7 +200,8 @@ async def complete_payment(session: AsyncSession, bot: Bot, payment: Payment) ->
 
     # Сначала выдаём доступ: если панель недоступна, платёж останется pending
     # и будет повторно обработан фоновой задачей — деньги не «сгорят».
-    subscription = await issue_or_extend(session, user, days=days, plan=plan)
+    # Оплаченный период начинается с полного лимита — израсходованное обнуляем.
+    subscription = await issue_or_extend(session, user, days=days, plan=plan, reset_traffic=True)
 
     payment.status = PaymentStatus.paid
     payment.paid_at = utcnow()

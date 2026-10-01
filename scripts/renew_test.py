@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -136,6 +138,78 @@ async def pay(dp, bot, plan_id: int) -> None:
     await dp.feed_update(bot, Update(update_id=next(_ids), message=msg))
 
 
+async def check_xui_parsing() -> None:
+    """Разбор ответа 3x-ui на подставных данных — без сети и без настоящей панели."""
+    print("\nРазбор ответа 3x-ui")
+    from bot.services.vpn.xui import XuiPanel
+
+    def ms(moment: datetime) -> int:
+        return int(moment.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    email = "tg42"
+    later = utcnow() + timedelta(days=40)
+    # статистика одна на email и приходит в каждом inbound'е
+    stat = {"email": email, "up": 3 * GB, "down": 2 * GB, "expiryTime": ms(later), "enable": True}
+    client = {"email": email, "subId": "sub42", "totalGB": 0, "enable": True}
+    inbounds = [
+        {
+            "id": 1,
+            "protocol": "vless",
+            "settings": {"clients": [dict(client, id="uuid42", expiryTime=ms(utcnow() + timedelta(days=10)))]},
+            "clientStats": [stat],
+        },
+        {
+            "id": 2,
+            "protocol": "hysteria",
+            "settings": json.dumps({"clients": [dict(client, auth="pass42", expiryTime=ms(later))]}),
+            "clientStats": [stat],
+        },
+        {"id": 3, "protocol": "vmess", "settings": {"clients": []}, "clientStats": []},
+    ]
+
+    xui = XuiPanel()
+
+    async def fake_inbounds():
+        return copy.deepcopy(inbounds)
+
+    xui._fetch_inbounds = fake_inbounds
+    account = await xui.get(email)
+    check(account.used_traffic == 5 * GB, "расход не умножается на число inbound'ов")
+    check(abs((account.expires_at - later).total_seconds()) < 1, "срок — самый поздний из inbound'ов")
+
+    inbounds[0]["settings"]["clients"][0]["expiryTime"] = -30 * 86400 * 1000
+    inbounds = inbounds[:1]
+    inbounds[0]["clientStats"] = []
+    account = await xui.get(email)
+    check(abs((account.expires_at - utcnow()).days - 30) <= 1,
+          "«старт после первого подключения» читается как остаток, а не как 1970 год")
+
+    calls: list = []
+
+    async def new_panel_api(method, path, **kwargs):
+        calls.append(path)
+        return {"success": True}
+
+    xui._api = new_panel_api
+    await xui.reset_traffic(email)
+    check(calls == [f"/panel/api/clients/resetTraffic/{email}"], "свежая сборка: сброс одной ручкой по email")
+
+    calls.clear()
+
+    async def classic_panel_api(method, path, **kwargs):
+        calls.append(path)
+        return {} if "/clients/" in path else {"success": True}  # {} — ответ 404 при soft_404
+
+    inbounds = [
+        {"id": 1, "protocol": "vless", "settings": {"clients": [dict(client, id="u")]}, "clientStats": []},
+        {"id": 3, "protocol": "vmess", "settings": {"clients": []}, "clientStats": []},
+    ]
+    xui._api = classic_panel_api
+    await xui.reset_traffic(email)
+    check(calls[1:] == [f"/panel/api/inbounds/1/resetClientTraffic/{email}"],
+          "классическая сборка: сброс в inbound'ах, где есть клиент")
+
+
 async def main() -> None:
     await init_db()
     bot = FakeBot(token="123456:TEST", default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -167,6 +241,16 @@ async def main() -> None:
         check(sub.traffic_limit == 50 * GB, "лимит трафика из тарифа применён")
 
     print("\nПродление активной подписки")
+    from bot.services.vpn.factory import get_panel
+
+    username = subscriptions.vpn_username(USER.id)
+    get_panel()._store[username].used_traffic = 7 * GB  # клиент успел потратить часть лимита
+    await asyncio.sleep(PAUSE)
+    await dp.feed_update(bot, message("/access"))
+    async with session_factory() as session:
+        sub = await repo.get_subscription(session, USER.id)
+        check(sub.traffic_used == 7 * GB, "расход подтянут из панели")
+
     await asyncio.sleep(PAUSE)
     await dp.feed_update(bot, message("/renew"))
     header = last("SendMessage").get("text", "")
@@ -188,11 +272,38 @@ async def main() -> None:
         sub = await repo.get_subscription(session, USER.id)
         check(sub.expires_at.date() == (first_until + timedelta(days=plan_days)).date(),
               "дни прибавились к остатку, а не обнулили его")
+        check(get_panel()._store[username].used_traffic == 0, "трафик в панели сброшен")
+        check(sub.traffic_used == 0, "и в боте расход обнулён")
+        second_until = sub.expires_at
+
+    print("\nПанель не ответила перед продлением")
+    from bot import tasks
+    from bot.services.vpn.base import VpnPanelError
+    from bot.texts import ru
+
+    panel = get_panel()
+
+    async def panel_down(_username: str):
+        raise VpnPanelError("панель не отвечает")
+
+    panel.get = panel_down
+    await pay(dp, bot, plan_id)
+    del panel.get  # дальше снова настоящий метод
+    check(last("SendMessage").get("text") == ru.ERROR_PANEL, "клиенту сказали, что доступ выдаётся")
+    async with session_factory() as session:
+        sub = await repo.get_subscription(session, USER.id)
+        check(sub.expires_at == second_until, "срок не пересчитан от старой даты и не обнулён")
+        stuck = await repo.pending_payments(session, "stars")
+        check(len(stuck) == 1 and stuck[0].external_id, "оплата сохранена для повтора")
+
+    await tasks.retry_stars_activations(bot, session_factory)
+    async with session_factory() as session:
+        sub = await repo.get_subscription(session, USER.id)
+        check(sub.expires_at.date() == (second_until + timedelta(days=plan_days)).date(),
+              "повтор прибавил дни к остатку ровно один раз")
         second_until = sub.expires_at
 
     print("\nВозобновление после истечения")
-    from bot.services.vpn.factory import get_panel
-
     # просрочиваем и в БД, и в панели — в жизни это одно и то же состояние
     expired_at = utcnow() - timedelta(days=5)
     async with session_factory() as session:
@@ -215,12 +326,14 @@ async def main() -> None:
     print("\nЛимит трафика по умолчанию")
     async with session_factory() as session:
         await runtime.set(session, "default_traffic_gb", "25")
+    get_panel()._store[username].used_traffic = 3 * GB
     await dp.feed_update(bot, message("/start", ADMIN))
     await asyncio.sleep(PAUSE)
     await dp.feed_update(bot, message(f"/give {USER.id} 10", ADMIN))
     async with session_factory() as session:
         sub = await repo.get_subscription(session, USER.id)
         check(sub.traffic_limit == 25 * GB, "ручная выдача применила лимит по умолчанию")
+    check(get_panel()._store[username].used_traffic == 3 * GB, "ручная выдача трафик не сбрасывает")
 
     async with session_factory() as session:
         new_plan = await repo.create_plan(
@@ -240,11 +353,6 @@ async def main() -> None:
         check(sub.subscription_url == url_before, "ссылка-подписка прежняя")
 
     print("\nПанель — источник правды")
-    from bot.services.vpn.factory import get_panel
-
-    panel = get_panel()
-    username = subscriptions.vpn_username(USER.id)
-
     # админ вручную продлил клиента в панели — бот должен это увидеть
     panel_until = utcnow() + timedelta(days=200)
     panel._store[username].expires_at = panel_until
@@ -277,6 +385,8 @@ async def main() -> None:
     async with session_factory() as session:
         sub = await repo.get_subscription(session, USER.id)
         check(sub.status.value == "expired", "удаление из панели отражено в боте")
+
+    await check_xui_parsing()
 
     await bot.session.close()
     print("\nПродление, лимиты и сверка с панелью работают.")
